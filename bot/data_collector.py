@@ -55,7 +55,7 @@ def fetch_market_snapshot() -> MarketSnapshot:
     calls, puts, expirations = _retry(lambda: _fetch_options_chain(spy))
 
     logger.info(
-        f"Snapshot: SPY={spy_price:.2f} VIX={vix_current:.2f} "
+        f"Snapshot: {CONFIG.spy}={spy_price:.2f} VIX={vix_current:.2f} "
         f"expirations={len(expirations)}"
     )
     return MarketSnapshot(
