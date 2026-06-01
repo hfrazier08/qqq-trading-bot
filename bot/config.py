@@ -3,7 +3,8 @@ from dataclasses import dataclass, field
 from typing import List
 from dotenv import load_dotenv
 
-load_dotenv()
+# Only load .env file locally — Railway injects vars directly into environment
+load_dotenv(override=False)
 
 
 @dataclass(frozen=True)
