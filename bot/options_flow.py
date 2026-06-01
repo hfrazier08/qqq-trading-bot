@@ -1,37 +1,37 @@
 """
-Options Flow Tracker
-Detects unusual options activity — whale-sized orders, sweeps, and large premium blocks.
-Uses yfinance options chain data to find volume/OI anomalies.
+Options Flow & Smart Money Tracker
+- Whale detection (large premium blocks)
+- Put/Call ratio (crowd sentiment)
+- Dark pool / institutional buying signals
+- Fear & Greed indicator
+- Follow the money summary
 """
 
 import logging
+import requests
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from typing import List, Optional
 
-import pandas as pd
 import yfinance as yf
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
-# Discord webhook for the sentiment/flow channel
 FLOW_WEBHOOK_URL = "https://discord.com/api/webhooks/1510817097159151656/3m4776CwYjFJoQ8mhGR67HCmqZu9fs82gLR9X0iKikDB5Iox_07sukVvjXTic_KEg-5Y"
-
-# Tickers to monitor for unusual flow
 FLOW_TICKERS = ["SPY", "QQQ"]
 
-# Thresholds
-MIN_VOLUME_OI_RATIO = 2.0      # volume must be 2x open interest to flag
-MIN_TOTAL_PREMIUM = 500_000    # minimum $500k in premium to flag as whale
-MIN_VOLUME = 500               # minimum raw volume
-MAX_DTE = 45                   # ignore LEAPS (too far out)
-MIN_DTE = 1                    # ignore same-day expiry
+MIN_VOLUME_OI_RATIO = 2.0
+MIN_TOTAL_PREMIUM   = 500_000
+MIN_VOLUME          = 500
+MAX_DTE             = 45
+MIN_DTE             = 1
 
 
 @dataclass
 class UnusualFlow:
     ticker: str
-    option_type: str        # "call" or "put"
+    option_type: str
     strike: float
     expiration: str
     dte: int
@@ -39,194 +39,291 @@ class UnusualFlow:
     open_interest: int
     vol_oi_ratio: float
     ask: float
-    total_premium: float    # volume * ask * 100
-    sentiment: str          # "bullish" or "bearish"
-    size: str               # "large" / "whale" / "mega"
+    total_premium: float
+    sentiment: str
+    size: str
     implied_volatility: float
 
 
-def fetch_unusual_flow(ticker: str) -> List[UnusualFlow]:
-    """
-    Scans the full options chain for a ticker and returns unusual activity.
-    Flags options where volume >> open interest and total premium is large.
-    """
+@dataclass
+class MarketSentiment:
+    ticker: str
+    price: float
+    # Put/Call ratio
+    put_call_ratio: float
+    pc_signal: str          # "bullish" / "bearish" / "neutral"
+    pc_note: str
+    # Volume analysis
+    total_call_volume: int
+    total_put_volume: int
+    call_put_vol_pct: float  # % of volume that is calls
+    # Premium analysis
+    total_call_premium: float
+    total_put_premium: float
+    # Whale activity
+    whale_calls: int
+    whale_puts: int
+    whale_bias: str
+    # Overall
+    crowd_bias: str          # what the crowd is doing
+    smart_money_bias: str    # what whales are doing
+    action: str              # what YOU should consider doing
+
+
+def _send(message: str, username: str = "Options Flow Bot 🐋") -> bool:
     try:
-        t = yf.Ticker(ticker)
-        expirations = t.options
-        today = date.today()
-        unusual = []
-
-        for exp_str in expirations:
-            exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
-            dte = (exp_date - today).days
-            if not (MIN_DTE <= dte <= MAX_DTE):
-                continue
-
-            try:
-                chain = t.option_chain(exp_str)
-            except Exception:
-                continue
-
-            for opt_type, df in [("call", chain.calls), ("put", chain.puts)]:
-                if df.empty:
-                    continue
-
-                df = df.copy()
-                df["dte"] = dte
-                df["opt_type"] = opt_type
-
-                # Filter for meaningful volume
-                df = df[df["volume"] >= MIN_VOLUME].copy()
-                if df.empty:
-                    continue
-
-                # Calculate vol/OI ratio
-                df["vol_oi_ratio"] = df["volume"] / df["openInterest"].replace(0, 1)
-
-                # Calculate total premium
-                df["ask"] = df["ask"].fillna(0)
-                df["total_premium"] = df["volume"] * df["ask"] * 100
-
-                # Filter for unusual activity
-                unusual_df = df[
-                    (df["vol_oi_ratio"] >= MIN_VOLUME_OI_RATIO) &
-                    (df["total_premium"] >= MIN_TOTAL_PREMIUM)
-                ].copy()
-
-                for _, row in unusual_df.iterrows():
-                    total = float(row["total_premium"])
-                    if total >= 5_000_000:
-                        size = "🐋 MEGA WHALE"
-                    elif total >= 2_000_000:
-                        size = "🦈 WHALE"
-                    else:
-                        size = "🔥 LARGE BLOCK"
-
-                    unusual.append(UnusualFlow(
-                        ticker=ticker,
-                        option_type=opt_type,
-                        strike=float(row["strike"]),
-                        expiration=exp_str,
-                        dte=dte,
-                        volume=int(row["volume"]),
-                        open_interest=int(row["openInterest"]),
-                        vol_oi_ratio=round(float(row["vol_oi_ratio"]), 1),
-                        ask=round(float(row["ask"]), 2),
-                        total_premium=round(total, 0),
-                        sentiment="bullish" if opt_type == "call" else "bearish",
-                        size=size,
-                        implied_volatility=round(float(row.get("impliedVolatility", 0)) * 100, 1),
-                    ))
-
-        # Sort by total premium descending
-        unusual.sort(key=lambda x: x.total_premium, reverse=True)
-        return unusual[:10]  # top 10
-
+        r = requests.post(FLOW_WEBHOOK_URL,
+                          json={"username": username, "content": message},
+                          timeout=10)
+        return r.status_code == 204
     except Exception as e:
-        logger.exception(f"Options flow fetch error for {ticker}: {e}")
-        return []
-
-
-def format_flow_alert(flows: List[UnusualFlow], ticker: str, spy_price: float) -> Optional[str]:
-    """Formats the flow data into a Discord message."""
-    if not flows:
-        return None
-
-    calls = [f for f in flows if f.option_type == "call"]
-    puts  = [f for f in flows if f.option_type == "put"]
-
-    total_call_premium = sum(f.total_premium for f in calls)
-    total_put_premium  = sum(f.total_premium for f in puts)
-    total_premium      = total_call_premium + total_put_premium
-
-    if total_call_premium > total_put_premium * 1.5:
-        bias = "🟢 BULLISH FLOW"
-        bias_note = "Smart money is buying CALLS — betting price goes UP"
-    elif total_put_premium > total_call_premium * 1.5:
-        bias = "🔴 BEARISH FLOW"
-        bias_note = "Smart money is buying PUTS — betting price goes DOWN"
-    else:
-        bias = "🟡 MIXED FLOW"
-        bias_note = "Mixed signals — both calls and puts being bought"
-
-    now_et = datetime.now().strftime("%I:%M %p ET")
-    lines = [
-        f"🐋 **{ticker} Options Flow — {now_et}**",
-        f"**{ticker} Price:** ${spy_price:.2f}",
-        f"**Overall Bias:** {bias}",
-        f"📌 {bias_note}",
-        f"",
-        f"💰 **Total Call Premium:** ${total_call_premium/1e6:.2f}M",
-        f"💸 **Total Put Premium:** ${total_put_premium/1e6:.2f}M",
-        f"📊 **Total Flow:** ${total_premium/1e6:.2f}M",
-        f"",
-        f"**Top Unusual Orders:**",
-    ]
-
-    for f in flows[:6]:
-        sentiment_emoji = "📈" if f.sentiment == "bullish" else "📉"
-        exp_fmt = datetime.strptime(f.expiration, "%Y-%m-%d").strftime("%b %d")
-        lines.append(
-            f"{sentiment_emoji} {f.size} | **{f.ticker} ${f.strike:.0f} {f.option_type.upper()}** "
-            f"exp {exp_fmt} ({f.dte}d) | "
-            f"Vol: {f.volume:,} / OI: {f.open_interest:,} ({f.vol_oi_ratio:.1f}x) | "
-            f"Premium: **${f.total_premium/1e6:.2f}M**"
-        )
-
-    lines += [
-        f"",
-        f"⚠️ *Options flow is not a guaranteed signal. Large orders can be hedges.*"
-    ]
-
-    return "\n".join(lines)
-
-
-def send_flow_alert(message: str) -> bool:
-    """Sends the flow alert to the sentiment Discord channel."""
-    import requests
-    try:
-        resp = requests.post(
-            FLOW_WEBHOOK_URL,
-            json={"username": "Options Flow Bot 🐋", "content": message},
-            timeout=10
-        )
-        return resp.status_code == 204
-    except Exception as e:
-        logger.error(f"Flow alert send error: {e}")
+        logger.error(f"Flow send error: {e}")
         return False
 
 
+def fetch_full_chain(ticker: str):
+    """Returns (calls_df, puts_df, expirations) with DTE filter applied."""
+    t = yf.Ticker(ticker)
+    expirations = t.options
+    today = date.today()
+    all_calls, all_puts = [], []
+
+    for exp_str in expirations:
+        exp_date = datetime.strptime(exp_str, "%Y-%m-%d").date()
+        dte = (exp_date - today).days
+        if not (MIN_DTE <= dte <= MAX_DTE):
+            continue
+        try:
+            chain = t.option_chain(exp_str)
+            c = chain.calls.copy(); c["expiration"] = exp_str; c["dte"] = dte
+            p = chain.puts.copy();  p["expiration"] = exp_str; p["dte"] = dte
+            all_calls.append(c)
+            all_puts.append(p)
+        except Exception:
+            continue
+
+    import pandas as pd
+    calls = pd.concat(all_calls) if all_calls else pd.DataFrame()
+    puts  = pd.concat(all_puts)  if all_puts  else pd.DataFrame()
+    return calls, puts
+
+
+def analyze_sentiment(ticker: str, price: float) -> Optional[MarketSentiment]:
+    """Full sentiment analysis — crowd + smart money."""
+    try:
+        calls, puts = fetch_full_chain(ticker)
+        if calls.empty or puts.empty:
+            return None
+
+        # ── Volume analysis ──
+        total_call_vol = int(calls["volume"].fillna(0).sum())
+        total_put_vol  = int(puts["volume"].fillna(0).sum())
+        total_vol = total_call_vol + total_put_vol
+        call_pct = (total_call_vol / total_vol * 100) if total_vol else 50
+
+        # ── Put/Call ratio ──
+        pc_ratio = round(total_put_vol / total_call_vol, 2) if total_call_vol > 0 else 1.0
+        if pc_ratio < 0.7:
+            pc_signal, pc_note = "bullish", "Crowd is buying CALLS aggressively — everyone is bullish"
+        elif pc_ratio > 1.2:
+            pc_signal, pc_note = "bearish", "Crowd is buying PUTS aggressively — everyone is fearful"
+        else:
+            pc_signal, pc_note = "neutral", "Balanced call/put activity — no clear crowd bias"
+
+        # ── Premium analysis ──
+        calls["premium"] = calls["volume"].fillna(0) * calls["ask"].fillna(0) * 100
+        puts["premium"]  = puts["volume"].fillna(0) * puts["ask"].fillna(0) * 100
+        total_call_prem = float(calls["premium"].sum())
+        total_put_prem  = float(puts["premium"].sum())
+
+        # ── Whale detection ──
+        calls["vol_oi_ratio"] = calls["volume"] / calls["openInterest"].replace(0, 1)
+        puts["vol_oi_ratio"]  = puts["volume"]  / puts["openInterest"].replace(0, 1)
+
+        whale_call_df = calls[
+            (calls["volume"] >= MIN_VOLUME) &
+            (calls["vol_oi_ratio"] >= MIN_VOLUME_OI_RATIO) &
+            (calls["premium"] >= MIN_TOTAL_PREMIUM)
+        ]
+        whale_put_df = puts[
+            (puts["volume"] >= MIN_VOLUME) &
+            (puts["vol_oi_ratio"] >= MIN_VOLUME_OI_RATIO) &
+            (puts["premium"] >= MIN_TOTAL_PREMIUM)
+        ]
+
+        whale_calls = len(whale_call_df)
+        whale_puts  = len(whale_put_df)
+        whale_call_prem = float(whale_call_df["premium"].sum())
+        whale_put_prem  = float(whale_put_df["premium"].sum())
+
+        if whale_call_prem > whale_put_prem * 1.5:
+            whale_bias = "bullish"
+        elif whale_put_prem > whale_call_prem * 1.5:
+            whale_bias = "bearish"
+        else:
+            whale_bias = "neutral"
+
+        # ── Crowd bias (put/call ratio) ──
+        crowd_bias = pc_signal
+
+        # ── Smart money bias (whale premium) ──
+        smart_money_bias = whale_bias
+
+        # ── Action recommendation ──
+        # When smart money AND crowd agree → strong signal
+        # When they disagree → follow smart money (whales know more)
+        if smart_money_bias == "bullish" and crowd_bias == "bullish":
+            action = "🚀 STRONG BUY SIGNAL — Both whales AND crowd are bullish. High conviction call opportunity."
+        elif smart_money_bias == "bullish" and crowd_bias != "bullish":
+            action = "🐋 FOLLOW THE WHALES — Smart money is buying calls while crowd is uncertain. Lean bullish."
+        elif smart_money_bias == "bearish" and crowd_bias == "bearish":
+            action = "🔴 STRONG SELL SIGNAL — Both whales AND crowd are bearish. Consider puts."
+        elif smart_money_bias == "bearish" and crowd_bias != "bearish":
+            action = "🐋 FOLLOW THE WHALES — Smart money is buying puts while crowd is uncertain. Lean bearish."
+        elif smart_money_bias == "neutral" and crowd_bias == "bullish":
+            action = "📈 CROWD IS BULLISH — No big whale activity but retail is buying calls. Moderate bullish."
+        elif smart_money_bias == "neutral" and crowd_bias == "bearish":
+            action = "📉 CROWD IS FEARFUL — No big whale activity but retail is buying puts. Be cautious."
+        else:
+            action = "⏳ NO CLEAR SIGNAL — Mixed or neutral activity. Wait for a clearer setup."
+
+        return MarketSentiment(
+            ticker=ticker,
+            price=price,
+            put_call_ratio=pc_ratio,
+            pc_signal=pc_signal,
+            pc_note=pc_note,
+            total_call_volume=total_call_vol,
+            total_put_volume=total_put_vol,
+            call_put_vol_pct=round(call_pct, 1),
+            total_call_premium=total_call_prem,
+            total_put_premium=total_put_prem,
+            whale_calls=whale_calls,
+            whale_puts=whale_puts,
+            whale_bias=whale_bias,
+            crowd_bias=crowd_bias,
+            smart_money_bias=smart_money_bias,
+            action=action,
+        )
+    except Exception as e:
+        logger.exception(f"Sentiment analysis error for {ticker}: {e}")
+        return None
+
+
+def fetch_unusual_flow(ticker: str, calls, puts) -> List[UnusualFlow]:
+    """Find specific unusual option orders from pre-fetched chain data."""
+    unusual = []
+    try:
+        for opt_type, df in [("call", calls), ("put", puts)]:
+            if df.empty:
+                continue
+            df = df.copy()
+            df["vol_oi_ratio"] = df["volume"].fillna(0) / df["openInterest"].replace(0, 1)
+            df["premium"] = df["volume"].fillna(0) * df["ask"].fillna(0) * 100
+            unusual_df = df[
+                (df["volume"] >= MIN_VOLUME) &
+                (df["vol_oi_ratio"] >= MIN_VOLUME_OI_RATIO) &
+                (df["premium"] >= MIN_TOTAL_PREMIUM)
+            ].copy()
+
+            for _, row in unusual_df.iterrows():
+                total = float(row["premium"])
+                if total >= 5_000_000:
+                    size = "🐋 MEGA WHALE"
+                elif total >= 2_000_000:
+                    size = "🦈 WHALE"
+                else:
+                    size = "🔥 LARGE BLOCK"
+
+                unusual.append(UnusualFlow(
+                    ticker=ticker,
+                    option_type=opt_type,
+                    strike=float(row["strike"]),
+                    expiration=row.get("expiration", ""),
+                    dte=int(row.get("dte", 0)),
+                    volume=int(row["volume"]),
+                    open_interest=int(row["openInterest"]),
+                    vol_oi_ratio=round(float(row["vol_oi_ratio"]), 1),
+                    ask=round(float(row["ask"]), 2),
+                    total_premium=round(total, 0),
+                    sentiment="bullish" if opt_type == "call" else "bearish",
+                    size=size,
+                    implied_volatility=round(float(row.get("impliedVolatility", 0)) * 100, 1),
+                ))
+    except Exception as e:
+        logger.exception(f"Unusual flow error: {e}")
+
+    unusual.sort(key=lambda x: x.total_premium, reverse=True)
+    return unusual[:8]
+
+
+def format_full_report(sentiment: MarketSentiment, flows: List[UnusualFlow]) -> str:
+    """Builds the full Discord message."""
+    now_et = datetime.now().strftime("%I:%M %p ET")
+
+    crowd_emoji  = "🟢" if sentiment.crowd_bias == "bullish" else ("🔴" if sentiment.crowd_bias == "bearish" else "🟡")
+    whale_emoji  = "🟢" if sentiment.smart_money_bias == "bullish" else ("🔴" if sentiment.smart_money_bias == "bearish" else "🟡")
+
+    lines = [
+        f"🐋 **{sentiment.ticker} Smart Money Report — {now_et}**",
+        f"**Price:** ${sentiment.price:.2f}",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+        f"",
+        f"**📊 CROWD SENTIMENT** {crowd_emoji}",
+        f"Put/Call Ratio: **{sentiment.put_call_ratio:.2f}** — {sentiment.pc_note}",
+        f"Call Volume: **{sentiment.total_call_volume:,}** ({sentiment.call_put_vol_pct:.0f}% of total)",
+        f"Put Volume:  **{sentiment.total_put_volume:,}** ({100-sentiment.call_put_vol_pct:.0f}% of total)",
+        f"Call Premium: **${sentiment.total_call_premium/1e6:.2f}M** | Put Premium: **${sentiment.total_put_premium/1e6:.2f}M**",
+        f"",
+        f"**🐋 SMART MONEY (WHALES)** {whale_emoji}",
+        f"Whale Call Orders: **{sentiment.whale_calls}** | Whale Put Orders: **{sentiment.whale_puts}**",
+        f"Whale Bias: **{sentiment.smart_money_bias.upper()}**",
+        f"",
+        f"**💡 WHAT TO DO:**",
+        f"{sentiment.action}",
+        f"━━━━━━━━━━━━━━━━━━━━━━",
+    ]
+
+    if flows:
+        lines.append(f"**🔥 Top Unusual Orders:**")
+        for f in flows[:5]:
+            s_emoji = "📈" if f.sentiment == "bullish" else "📉"
+            exp_fmt = datetime.strptime(f.expiration, "%Y-%m-%d").strftime("%b %d") if f.expiration else "?"
+            lines.append(
+                f"{s_emoji} {f.size} | **${f.strike:.0f} {f.option_type.upper()}** {exp_fmt} ({f.dte}d) | "
+                f"Vol: {f.volume:,} vs OI: {f.open_interest:,} ({f.vol_oi_ratio:.1f}x) | "
+                f"**${f.total_premium/1e6:.2f}M**"
+            )
+        lines.append("")
+
+    lines.append("⚠️ *Flow data is informational. Large orders can be hedges. Always use with technical signals.*")
+    return "\n".join(lines)
+
+
 def run_flow_scan(tickers: list = None) -> None:
-    """Main entry point — scans all tickers and sends alerts if unusual flow found."""
+    """Main entry — scans all tickers, sends full smart money report."""
     if tickers is None:
         tickers = FLOW_TICKERS
 
-    try:
-        import yfinance as yf
-        all_flows = []
-
-        for ticker in tickers:
-            logger.info(f"Scanning options flow for {ticker}...")
+    for ticker in tickers:
+        try:
+            logger.info(f"Running flow scan for {ticker}...")
             price_info = yf.Ticker(ticker).fast_info
             price = float(price_info.get("lastPrice", 0) or 0)
-            flows = fetch_unusual_flow(ticker)
 
-            if flows:
-                message = format_flow_alert(flows, ticker, price)
-                if message:
-                    sent = send_flow_alert(message)
-                    logger.info(f"Flow alert for {ticker}: {len(flows)} unusual orders, sent={sent}")
-                    all_flows.extend(flows)
-            else:
-                logger.info(f"No unusual flow detected for {ticker}")
+            # Fetch chain once, use for both sentiment + flow
+            calls, puts = fetch_full_chain(ticker)
+            if calls.empty:
+                logger.warning(f"Empty chain for {ticker}")
+                continue
 
-        if not all_flows:
-            # Send a quiet no-activity update
-            send_flow_alert(
-                f"🔍 **Options Flow Scan — {datetime.now().strftime('%I:%M %p ET')}**\n"
-                f"No unusual whale activity detected on SPY or QQQ right now.\n"
-                f"Market flow appears normal 📊"
-            )
+            sentiment = analyze_sentiment(ticker, price)
+            flows = fetch_unusual_flow(ticker, calls, puts) if sentiment else []
 
-    except Exception as e:
-        logger.exception(f"Flow scan error: {e}")
+            if sentiment:
+                message = format_full_report(sentiment, flows)
+                sent = _send(message)
+                logger.info(f"Flow report sent for {ticker}: {sent}")
+
+        except Exception as e:
+            logger.exception(f"Flow scan error for {ticker}: {e}")
