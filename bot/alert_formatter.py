@@ -1,13 +1,16 @@
 from typing import Optional
+from bot.config import CONFIG
 from bot.signal_generator import TradingSignal, BUY_CALL, BUY_PUT, EXIT_LONG, EXIT_SHORT, HOLD
 from bot.trade_constructor import SingleLegTrade
 
+TICKER = CONFIG.spy  # "SPY" or "QQQ" depending on which bot
+
 SIGNAL_COLORS = {
-    BUY_CALL:   0x00C851,   # green
-    BUY_PUT:    0xFF4444,   # red
-    EXIT_LONG:  0xFF8800,   # orange
+    BUY_CALL:   0x00C851,
+    BUY_PUT:    0xFF4444,
+    EXIT_LONG:  0xFF8800,
     EXIT_SHORT: 0xFF8800,
-    HOLD:       0x9E9E9E,   # gray
+    HOLD:       0x9E9E9E,
 }
 
 SIGNAL_EMOJI = {
@@ -33,15 +36,14 @@ def format_discord_embed(
     color = SIGNAL_COLORS.get(signal.signal, 0x9E9E9E)
     conf_label = _confidence_label(signal.confidence)
 
-    title = f"{emoji} SPY {signal.signal.replace('_', ' ')} — {signal.confidence}% ({conf_label})"
+    title = f"{emoji} {TICKER} {signal.signal.replace('_', ' ')} — {signal.confidence}% ({conf_label})"
 
     fields = []
 
-    # Market snapshot
     fields.append({
         "name": "📊 Market Snapshot",
         "value": (
-            f"**SPY Price:** ${spy_price:.2f}\n"
+            f"**{TICKER} Price:** ${spy_price:.2f}\n"
             f"**Signal:** {signal.signal}\n"
             f"**Direction:** {signal.direction.capitalize()}\n"
             f"**Risk Level:** {signal.risk_level.capitalize()}"
@@ -49,7 +51,6 @@ def format_discord_embed(
         "inline": False,
     })
 
-    # Confidence breakdown
     bd = signal.confidence_breakdown
     fields.append({
         "name": "🎯 Confidence Breakdown",
@@ -62,7 +63,6 @@ def format_discord_embed(
         "inline": True,
     })
 
-    # Research reasons
     reasons_text = "\n".join(f"• {r}" for r in signal.signal_reasons[:5])
     fields.append({
         "name": "🔍 Research Summary",
@@ -71,11 +71,10 @@ def format_discord_embed(
     })
 
     if trade is not None:
-        # Trade details
         fields.append({
             "name": f"💼 Trade: Buy {trade.option_type}",
             "value": (
-                f"**Symbol:** SPY\n"
+                f"**Symbol:** {TICKER}\n"
                 f"**Action:** Buy {trade.option_type}\n"
                 f"**Strike:** ${trade.strike:.0f}\n"
                 f"**Expiration:** {trade.expiration_label} ({trade.dte} DTE)"
@@ -109,7 +108,7 @@ def format_discord_embed(
             "name": "🎯 Key Price Levels",
             "value": (
                 f"**Breakeven at expiry:** ${trade.breakeven:.2f}\n"
-                f"**Profit target (SPY):** ${trade.profit_target:.2f}\n"
+                f"**Profit target ({TICKER}):** ${trade.profit_target:.2f}\n"
                 f"**Stop loss:** Exit if option drops to **${trade.stop_loss_price:.2f}** (50% loss)"
             ),
             "inline": False,
@@ -139,12 +138,12 @@ def format_discord_embed(
     })
 
     return {
-        "username": "QQQ Options Bot",
+        "username": f"{TICKER} Options Bot",
         "embeds": [{
             "title": title,
             "color": color,
             "fields": fields[:25],
-            "footer": {"text": f"Scanned at {signal.timestamp}"},
+            "footer": {"text": f"Scanned at {signal.timestamp} | {TICKER} Options Bot"},
         }],
     }
 
@@ -156,7 +155,7 @@ def format_whatsapp_message(
 ) -> str:
     emoji = SIGNAL_EMOJI.get(signal.signal, "⚪")
     lines = [
-        f"{emoji} *SPY BOT — {signal.signal}*",
+        f"{emoji} *{TICKER} BOT — {signal.signal}*",
         f"Price: ${spy_price:.2f} | Conf: {signal.confidence}%",
         "",
     ]
@@ -178,18 +177,15 @@ def format_whatsapp_message(
 
 
 def _confidence_label(conf: int) -> str:
-    if conf >= 90:
-        return "VERY HIGH"
-    if conf >= 80:
-        return "HIGH"
-    if conf >= 70:
-        return "MODERATE"
+    if conf >= 90: return "VERY HIGH"
+    if conf >= 80: return "HIGH"
+    if conf >= 70: return "MODERATE"
     return "LOW"
 
 
 def _robinhood_steps(trade: SingleLegTrade) -> str:
     return (
-        f"1️⃣ Open Robinhood → Search **QQQ**\n"
+        f"1️⃣ Open Robinhood → Search **{TICKER}**\n"
         f"2️⃣ Tap **Trade** → **{trade.option_type}**\n"
         f"3️⃣ Select expiration: **{trade.expiration_label}**\n"
         f"4️⃣ Find strike: **${trade.strike:.0f}**\n"
@@ -197,5 +193,5 @@ def _robinhood_steps(trade: SingleLegTrade) -> str:
         f"6️⃣ Order type: **Limit** → enter **${trade.ask_price:.2f}**\n"
         f"7️⃣ Review cost: **${trade.total_cost:,.0f} total**\n"
         f"8️⃣ Tap **Review** → **Submit**\n"
-        f"9️⃣ Set alert: notify if SPY hits **${trade.breakeven:.2f}**"
+        f"9️⃣ Set alert: notify if {TICKER} hits **${trade.breakeven:.2f}**"
     )[:1024]
