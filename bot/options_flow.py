@@ -301,88 +301,61 @@ def format_full_report(sentiment: MarketSentiment, flows: List[UnusualFlow]) -> 
 
 
 def run_sentiment_daily_report() -> None:
-    """End of day sentiment summary — sent at 4:00 PM ET to the flow channel."""
+    """End of day full sentiment report in standard format."""
     try:
         now_et = datetime.now()
         spy_info = yf.Ticker("SPY").fast_info
         qqq_info = yf.Ticker("QQQ").fast_info
-        vix_info = yf.Ticker("^VIX").fast_info
+        vix      = float(yf.Ticker("^VIX").fast_info.get("lastPrice", 0) or 0)
 
-        spy_price  = float(spy_info.get("lastPrice", 0) or 0)
-        spy_prev   = float(spy_info.get("previousClose", spy_price) or spy_price)
-        qqq_price  = float(qqq_info.get("lastPrice", 0) or 0)
-        qqq_prev   = float(qqq_info.get("previousClose", qqq_price) or qqq_price)
-        vix        = float(vix_info.get("lastPrice", 0) or 0)
+        spy_price = float(spy_info.get("lastPrice", 0) or 0)
+        spy_prev  = float(spy_info.get("previousClose", spy_price) or spy_price)
+        qqq_price = float(qqq_info.get("lastPrice", 0) or 0)
+        qqq_prev  = float(qqq_info.get("previousClose", qqq_price) or qqq_price)
+        spy_pct   = (spy_price - spy_prev) / spy_prev * 100 if spy_prev else 0
+        qqq_pct   = (qqq_price - qqq_prev) / qqq_prev * 100 if qqq_prev else 0
 
-        spy_pct = (spy_price - spy_prev) / spy_prev * 100 if spy_prev else 0
-        qqq_pct = (qqq_price - qqq_prev) / qqq_prev * 100 if qqq_prev else 0
-
-        spy_emoji = "🟢" if spy_pct >= 0 else "🔴"
-        qqq_emoji = "🟢" if qqq_pct >= 0 else "🔴"
-        vix_note  = "calm 😌" if vix < 15 else ("normal 😐" if vix < 25 else "elevated ⚠️")
-
-        # Quick sentiment from put/call on SPY
-        try:
-            spy_calls, spy_puts = fetch_full_chain("SPY")
-            total_cv = int(spy_calls["volume"].fillna(0).sum())
-            total_pv = int(spy_puts["volume"].fillna(0).sum())
-            pc_ratio = round(total_pv / total_cv, 2) if total_cv > 0 else 1.0
-            if pc_ratio < 0.7:
-                crowd_today = "🟢 Bullish — crowd bought calls all day"
-            elif pc_ratio > 1.2:
-                crowd_today = "🔴 Bearish — crowd bought puts all day"
-            else:
-                crowd_today = "🟡 Neutral — balanced call/put activity"
-            pc_line = f"Put/Call Ratio: **{pc_ratio}** — {crowd_today}"
-        except Exception:
-            pc_line = "Put/Call Ratio: N/A"
-
-        # VIX direction
-        try:
-            vix_hist = yf.Ticker("^VIX").history(period="2d")
-            vix_prev = float(vix_hist["Close"].iloc[-2]) if len(vix_hist) >= 2 else vix
-            vix_change = vix - vix_prev
-            vix_dir = f"{'↑' if vix_change > 0 else '↓'} {abs(vix_change):.2f} vs yesterday"
-        except Exception:
-            vix_dir = ""
+        # Run full analysis for SPY
+        spy_calls, spy_puts = fetch_full_chain("SPY")
+        sentiment = analyze_sentiment("SPY", spy_price)
+        flows     = fetch_unusual_flow("SPY", spy_calls, spy_puts)
 
         # Tomorrow outlook
-        if spy_pct > 0.5 and pc_ratio < 0.8:
+        if spy_pct > 0.5 and sentiment and sentiment.crowd_bias == "bullish":
             outlook = "📈 **Bullish setup for tomorrow** — strong close + bullish flow. Watch for calls at open."
-        elif spy_pct < -0.5 and pc_ratio > 1.1:
+        elif spy_pct < -0.5 and sentiment and sentiment.crowd_bias == "bearish":
             outlook = "📉 **Bearish setup for tomorrow** — weak close + bearish flow. Watch for puts at open."
         elif vix > 20:
             outlook = "⚠️ **Volatile conditions** — elevated VIX. Wait for clear signal before trading."
         else:
             outlook = "⏳ **Mixed signals** — no strong directional bias. Let the bots find the setup."
 
-        message = (
-            f"📊 **Daily Sentiment Report — {now_et.strftime('%b %d, %Y')}**\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"{spy_emoji} **SPY:** ${spy_price:.2f} ({spy_pct:+.2f}%)\n"
-            f"{qqq_emoji} **QQQ:** ${qqq_price:.2f} ({qqq_pct:+.2f}%)\n"
-            f"😨 **VIX:** {vix:.2f} ({vix_note}) {vix_dir}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**📊 Today's Crowd Sentiment:**\n"
-            f"{pc_line}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**🔭 Tomorrow's Outlook:**\n"
-            f"{outlook}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"See you tomorrow at **9:00 AM ET**! 👋"
+        spy_e = "🟢" if spy_pct >= 0 else "🔴"
+        qqq_e = "🟢" if qqq_pct >= 0 else "🔴"
+
+        header = (
+            f"📊 **End of Day Sentiment — {now_et.strftime('%b %d, %Y')}**\n"
+            f"{spy_e} SPY: ${spy_price:.2f} ({spy_pct:+.2f}%)  "
+            f"{qqq_e} QQQ: ${qqq_price:.2f} ({qqq_pct:+.2f}%)  "
+            f"😨 VIX: {vix:.2f}\n"
         )
-        _send(message, username="Options Flow Bot 🐋")
+
+        # Use standard format_full_report for the body
+        body = format_full_report(sentiment, flows) if sentiment else "⚠️ Could not fetch sentiment data."
+
+        footer = f"\n**🔭 Tomorrow's Outlook:**\n{outlook}\nSee you tomorrow at **9:00 AM ET**! 👋"
+
+        _send(header + body + footer, username="Options Flow Bot 🐋")
         logger.info("Sentiment daily report sent")
     except Exception as e:
         logger.exception(f"Sentiment daily report error: {e}")
 
 
 def run_sentiment_weekly_report() -> None:
-    """Friday end of week sentiment summary."""
+    """Friday end of week full sentiment report."""
     try:
         now_et = datetime.now()
 
-        # Weekly performance for SPY + QQQ
         spy_hist = yf.Ticker("SPY").history(period="5d")
         qqq_hist = yf.Ticker("QQQ").history(period="5d")
         vix_hist = yf.Ticker("^VIX").history(period="5d")
@@ -396,46 +369,46 @@ def run_sentiment_weekly_report() -> None:
 
         spy_close, spy_wpct = week_change(spy_hist)
         qqq_close, qqq_wpct = week_change(qqq_hist)
-        vix_close, vix_wpct = week_change(vix_hist)
-
-        spy_emoji = "🟢" if spy_wpct >= 0 else "🔴"
-        qqq_emoji = "🟢" if qqq_wpct >= 0 else "🔴"
-        vix_emoji = "📉" if vix_wpct < 0 else "📈"
-
-        # Average VIX this week
         avg_vix = round(float(vix_hist["Close"].mean()), 2) if not vix_hist.empty else 0
         vix_env = "calm (good for buyers)" if avg_vix < 16 else ("normal" if avg_vix < 22 else "elevated (volatile week)")
 
-        # Best day this week
         if not spy_hist.empty:
-            spy_hist["daily_pct"] = spy_hist["Close"].pct_change() * 100
-            best_day_val  = float(spy_hist["daily_pct"].max())
-            worst_day_val = float(spy_hist["daily_pct"].min())
+            spy_hist["dp"] = spy_hist["Close"].pct_change() * 100
+            best_day  = float(spy_hist["dp"].max())
+            worst_day = float(spy_hist["dp"].min())
         else:
-            best_day_val = worst_day_val = 0
+            best_day = worst_day = 0
 
-        next_week_note = (
+        next_week = (
             "📈 Bullish momentum heading into next week" if spy_wpct > 1
             else "📉 Bearish momentum — be cautious Monday open" if spy_wpct < -1
             else "⏳ Flat week — watch for breakout direction Monday"
         )
 
-        message = (
+        spy_e = "🟢" if spy_wpct >= 0 else "🔴"
+        qqq_e = "🟢" if qqq_wpct >= 0 else "🔴"
+
+        # Run full live analysis for Friday close
+        spy_price = spy_close
+        spy_calls, spy_puts = fetch_full_chain("SPY")
+        sentiment = analyze_sentiment("SPY", spy_price)
+        flows     = fetch_unusual_flow("SPY", spy_calls, spy_puts)
+
+        header = (
             f"📊 **Weekly Sentiment Report — Week of {now_et.strftime('%b %d, %Y')}**\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**This Week's Market Performance:**\n"
-            f"{spy_emoji} **SPY:** ${spy_close:.2f} ({spy_wpct:+.2f}% this week)\n"
-            f"{qqq_emoji} **QQQ:** ${qqq_close:.2f} ({qqq_wpct:+.2f}% this week)\n"
-            f"{vix_emoji} **VIX avg:** {avg_vix} — {vix_env}\n"
+            f"{spy_e} **SPY:** ${spy_close:.2f} ({spy_wpct:+.2f}% this week)\n"
+            f"{qqq_e} **QQQ:** ${qqq_close:.2f} ({qqq_wpct:+.2f}% this week)\n"
+            f"😨 **VIX avg:** {avg_vix} — {vix_env}\n"
+            f"📈 Best day: +{best_day:.2f}%  |  📉 Worst day: {worst_day:.2f}%\n"
             f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"📈 **Best day:** +{best_day_val:.2f}%  |  📉 **Worst day:** {worst_day_val:.2f}%\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"**🔭 Next Week Outlook:**\n"
-            f"{next_week_note}\n"
-            f"━━━━━━━━━━━━━━━━━━━━━━\n"
-            f"Have a great weekend! Back Monday at **9:00 AM ET** 🚀"
+            f"**Friday Close Flow:**\n"
         )
-        _send(message, username="Options Flow Bot 🐋")
+
+        body   = format_full_report(sentiment, flows) if sentiment else ""
+        footer = f"\n**🔭 Next Week:** {next_week}\nHave a great weekend! Back Monday at **9:00 AM ET** 🚀"
+
+        _send(header + body + footer, username="Options Flow Bot 🐋")
         logger.info("Sentiment weekly report sent")
     except Exception as e:
         logger.exception(f"Sentiment weekly report error: {e}")
