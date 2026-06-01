@@ -681,41 +681,25 @@ def start_scheduler() -> None:
     scheduler.add_job(run_trend_update, trigger=IntervalTrigger(hours=1),
                       id="trend_update", max_instances=1, coalesce=True, misfire_grace_time=120)
 
-    scheduler.add_job(run_premarket_alert, trigger=CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET),
+    # QQQ-only alerts — pre-market, opening bell, closing bell go to QQQ channel
+    scheduler.add_job(run_premarket_alert, trigger=CronTrigger(hour=9, minute=1, day_of_week="mon-fri", timezone=ET),
                       id="premarket", max_instances=1)
 
-    scheduler.add_job(run_opening_bell, trigger=CronTrigger(hour=9, minute=30, day_of_week="mon-fri", timezone=ET),
+    scheduler.add_job(run_opening_bell, trigger=CronTrigger(hour=9, minute=31, day_of_week="mon-fri", timezone=ET),
                       id="opening_bell", max_instances=1)
 
-    scheduler.add_job(run_closing_bell, trigger=CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=ET),
+    scheduler.add_job(run_closing_bell, trigger=CronTrigger(hour=16, minute=3, day_of_week="mon-fri", timezone=ET),
                       id="closing_bell", max_instances=1)
 
-    # Economic calendar — every weekday at 8:00 AM ET
-    scheduler.add_job(run_economic_calendar_check, trigger=CronTrigger(hour=8, minute=0, day_of_week="mon-fri", timezone=ET),
-                      id="econ_calendar", max_instances=1)
-
-    # Weekly money report — every Friday at 4:00 PM ET
-    scheduler.add_job(run_weekly_report, trigger=CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=ET),
+    # QQQ weekly + daily money reports — go to QQQ channel only
+    scheduler.add_job(run_weekly_report, trigger=CronTrigger(hour=16, minute=5, day_of_week="fri", timezone=ET),
                       id="weekly_report", max_instances=1)
 
-    # Daily money report — Mon-Thu at 4:01 PM ET
-    scheduler.add_job(run_daily_money_report, trigger=CronTrigger(hour=16, minute=1, day_of_week="mon-thu", timezone=ET),
+    scheduler.add_job(run_daily_money_report, trigger=CronTrigger(hour=16, minute=4, day_of_week="mon-thu", timezone=ET),
                       id="daily_money_report", max_instances=1)
 
-    # Sentiment daily report — Mon-Thu at 4:02 PM ET
-    scheduler.add_job(run_sentiment_daily_report, trigger=CronTrigger(hour=16, minute=2, day_of_week="mon-thu", timezone=ET),
-                      id="sentiment_daily", max_instances=1)
-
-    # Sentiment weekly report — Friday at 4:02 PM ET
-    scheduler.add_job(run_sentiment_weekly_report, trigger=CronTrigger(hour=16, minute=2, day_of_week="fri", timezone=ET),
-                      id="sentiment_weekly", max_instances=1)
-
-    # Options flow scan — every 30 min during market hours
-    scheduler.add_job(
-        lambda: run_flow_scan(["SPY", "QQQ"]) if is_market_open() else None,
-        trigger=IntervalTrigger(minutes=30),
-        id="flow_scan", max_instances=1, coalesce=True, misfire_grace_time=60
-    )
+    # NOTE: Economic calendar, flow scan, and sentiment reports
+    # are handled by SPY bot only — no duplicates here
 
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
     run_scan_cycle()
