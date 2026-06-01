@@ -20,6 +20,7 @@ from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
 from bot.trade_logger import init_db, log_signal, log_trade_entry
+from bot.options_flow import run_flow_scan
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
@@ -660,6 +661,13 @@ def start_scheduler() -> None:
     # Weekly performance report — every Friday at 4:00 PM ET
     scheduler.add_job(run_weekly_report, trigger=CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=ET),
                       id="weekly_report", max_instances=1)
+
+    # Options flow scan — every 30 min during market hours
+    scheduler.add_job(
+        lambda: run_flow_scan(["SPY", "QQQ"]) if is_market_open() else None,
+        trigger=IntervalTrigger(minutes=30),
+        id="flow_scan", max_instances=1, coalesce=True, misfire_grace_time=60
+    )
 
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
     run_scan_cycle()
