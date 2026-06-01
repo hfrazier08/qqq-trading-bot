@@ -474,6 +474,161 @@ def run_closing_bell() -> None:
 
 
 # ─────────────────────────────────────────────
+# ECONOMIC CALENDAR WARNING — 8:00 AM daily
+# ─────────────────────────────────────────────
+def run_economic_calendar_check() -> None:
+    """Checks for high-impact economic events today or tomorrow and warns users."""
+    if datetime.now(ET).weekday() >= 5:
+        return
+    try:
+        import requests as req
+        from datetime import timedelta
+
+        # ForexFactory free JSON calendar feed
+        url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+        resp = req.get(url, timeout=10)
+        if resp.status_code != 200:
+            logger.warning(f"Economic calendar fetch failed: {resp.status_code}")
+            return
+
+        events = resp.json()
+        now_et = datetime.now(ET)
+        today_str = now_et.strftime("%Y-%m-%d")
+        tomorrow_str = (now_et + timedelta(days=1)).strftime("%Y-%m-%d")
+
+        # High-impact keywords to watch for
+        HIGH_IMPACT_KEYWORDS = [
+            "CPI", "PPI", "FOMC", "Fed", "Federal Reserve", "Interest Rate",
+            "NFP", "Non-Farm", "Jobs", "Unemployment", "GDP", "Inflation",
+            "Retail Sales", "PCE", "Powell"
+        ]
+
+        warnings_today = []
+        warnings_tomorrow = []
+
+        for event in events:
+            if event.get("impact", "").lower() != "high":
+                continue
+            title = event.get("title", "")
+            date_str = event.get("date", "")[:10]
+            time_str = event.get("date", "")[11:16] if len(event.get("date", "")) > 10 else "TBD"
+            currency = event.get("currency", "")
+
+            # Only care about USD events
+            if currency != "USD":
+                continue
+
+            # Check if it matches high impact keywords
+            if any(kw.lower() in title.lower() for kw in HIGH_IMPACT_KEYWORDS):
+                if date_str == today_str:
+                    warnings_today.append(f"• **{title}** at {time_str} ET")
+                elif date_str == tomorrow_str:
+                    warnings_tomorrow.append(f"• **{title}** tomorrow")
+
+        if warnings_today:
+            send_discord_alert({
+                "username": f"{CONFIG.spy} Options Bot",
+                "content": (
+                    f"🚨 **HIGH-IMPACT EVENT TODAY — BE CAREFUL**\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    + "\n".join(warnings_today) + "\n"
+                    f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⚠️ **Recommendation:** Avoid opening new positions today.\n"
+                    f"These events cause massive price swings — options can lose 80%+ in minutes.\n"
+                    f"📌 Wait until AFTER the event for a clearer signal."
+                )
+            })
+            logger.info(f"Economic warning sent: {len(warnings_today)} events today")
+
+        elif warnings_tomorrow:
+            send_discord_alert({
+                "username": f"{CONFIG.spy} Options Bot",
+                "content": (
+                    f"📅 **High-Impact Event Tomorrow — Plan Ahead**\n"
+                    + "\n".join(warnings_tomorrow) + "\n"
+                    f"⚠️ Consider closing any open positions before tomorrow.\n"
+                    f"📌 Wait for the data to drop before entering new trades."
+                )
+            })
+            logger.info(f"Economic warning sent: {len(warnings_tomorrow)} events tomorrow")
+
+        else:
+            logger.info("Economic calendar: no high-impact events today or tomorrow")
+
+    except Exception as e:
+        logger.exception(f"Economic calendar error: {e}")
+
+
+# ─────────────────────────────────────────────
+# WEEKLY PERFORMANCE REPORT — Friday 4:00 PM
+# ─────────────────────────────────────────────
+def run_weekly_report() -> None:
+    """Sends a full week recap every Friday at market close."""
+    try:
+        from datetime import timedelta
+
+        now_et = datetime.now(ET)
+        # Get dates for this week (Mon-Fri)
+        week_start = now_et - timedelta(days=now_et.weekday())
+        week_start_str = week_start.strftime("%Y-%m-%d")
+
+        # Load all paper trades this week
+        all_trades = _load_paper_trades()
+        week_trades = [t for t in all_trades if t.get("entry_time", "") >= week_start_str]
+        closed = [t for t in week_trades if t.get("outcome") in ("win", "loss", "breakeven")]
+        wins = [t for t in closed if t.get("outcome") == "win"]
+        losses = [t for t in closed if t.get("outcome") == "loss"]
+        open_trades = [t for t in week_trades if t.get("outcome") == "open"]
+        total_pnl = sum(t.get("pnl", 0) for t in closed)
+        win_rate = round(len(wins) / len(closed) * 100) if closed else 0
+
+        # SPY performance this week
+        spy_ticker = yf.Ticker(CONFIG.spy)
+        spy_hist = spy_ticker.history(period="5d")
+        if len(spy_hist) >= 2:
+            week_open = float(spy_hist["Close"].iloc[0])
+            week_close = float(spy_hist["Close"].iloc[-1])
+            spy_week_pct = (week_close - week_open) / week_open * 100
+            spy_line = f"**{CONFIG.spy} this week:** ${week_close:.2f} ({'+'if spy_week_pct>=0 else ''}{spy_week_pct:.2f}%)"
+        else:
+            spy_line = f"**{CONFIG.spy}:** N/A"
+
+        # Build trade detail lines
+        trade_lines = ""
+        for t in closed[-5:]:  # show last 5
+            outcome_emoji = "✅" if t.get("outcome") == "win" else "❌"
+            pnl = t.get("pnl", 0)
+            trade_lines += f"{outcome_emoji} ${t.get('strike', 0):.0f} {t.get('direction','').title()} | {'+'if pnl>=0 else ''}${pnl:,.0f} ({t.get('pnl_pct', 0):+.0f}%)\n"
+
+        if not trade_lines:
+            trade_lines = "No closed paper trades this week\n"
+
+        pnl_emoji = "💰" if total_pnl >= 0 else "📉"
+
+        send_discord_alert({
+            "username": f"{CONFIG.spy} Options Bot",
+            "content": (
+                f"📋 **Weekly Performance Report — {now_et.strftime('%b %d, %Y')}**\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"{spy_line}\n"
+                f"🔍 **Signals scanned:** {_daily_stats['scans']} (today)\n"
+                f"📊 **Trades fired:** {len(week_trades)} | **Closed:** {len(closed)}\n"
+                f"✅ **Wins:** {len(wins)}  ❌ **Losses:** {len(losses)}  "
+                f"{'🟡 **Open:** ' + str(len(open_trades)) if open_trades else ''}\n"
+                f"🎯 **Win Rate:** {win_rate}%\n"
+                f"{pnl_emoji} **Total P&L:** {'+'if total_pnl>=0 else ''}${total_pnl:,.0f}\n"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"**Trades this week:**\n{trade_lines}"
+                f"━━━━━━━━━━━━━━━━━━━━━━\n"
+                f"Have a great weekend! See you Monday at 9 AM 🚀"
+            )
+        })
+        logger.info("Weekly report sent")
+    except Exception as e:
+        logger.exception(f"Weekly report error: {e}")
+
+
+# ─────────────────────────────────────────────
 # SCHEDULER SETUP
 # ─────────────────────────────────────────────
 def start_scheduler() -> None:
@@ -497,6 +652,14 @@ def start_scheduler() -> None:
 
     scheduler.add_job(run_closing_bell, trigger=CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=ET),
                       id="closing_bell", max_instances=1)
+
+    # Economic calendar — every weekday at 8:00 AM ET
+    scheduler.add_job(run_economic_calendar_check, trigger=CronTrigger(hour=8, minute=0, day_of_week="mon-fri", timezone=ET),
+                      id="econ_calendar", max_instances=1)
+
+    # Weekly performance report — every Friday at 4:00 PM ET
+    scheduler.add_job(run_weekly_report, trigger=CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=ET),
+                      id="weekly_report", max_instances=1)
 
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
     run_scan_cycle()
