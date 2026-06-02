@@ -20,7 +20,7 @@ from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
 from bot.trade_logger import init_db, log_signal, log_trade_entry
-from bot.options_flow import run_flow_scan, run_sentiment_daily_report, run_sentiment_weekly_report
+# Flow/sentiment handled by SPY bot only — not imported here
 
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
@@ -702,20 +702,8 @@ def start_scheduler() -> None:
     scheduler.add_job(run_daily_money_report, trigger=CronTrigger(hour=16, minute=1, day_of_week="mon-thu", timezone=ET),
                       id="daily_money_report", max_instances=1)
 
-    # Sentiment daily report — Mon-Thu at 4:02 PM ET
-    scheduler.add_job(run_sentiment_daily_report, trigger=CronTrigger(hour=16, minute=2, day_of_week="mon-thu", timezone=ET),
-                      id="sentiment_daily", max_instances=1)
-
-    # Sentiment weekly report — Friday at 4:02 PM ET
-    scheduler.add_job(run_sentiment_weekly_report, trigger=CronTrigger(hour=16, minute=2, day_of_week="fri", timezone=ET),
-                      id="sentiment_weekly", max_instances=1)
-
-    # Options flow scan — every hour during market hours
-    scheduler.add_job(
-        lambda: run_flow_scan(["SPY", "QQQ"]) if is_market_open() else None,
-        trigger=IntervalTrigger(hours=1),
-        id="flow_scan", max_instances=1, coalesce=True, misfire_grace_time=120
-    )
+    # NOTE: Flow scan, sentiment reports handled by SPY bot + sentiment bot only
+    # QQQ bot only sends to QQQ channel
 
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
     run_scan_cycle()
