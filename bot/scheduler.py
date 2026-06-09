@@ -339,16 +339,6 @@ def run_scan_cycle() -> None:
                     "tp_alert_sent": False,
                     "sl_alert_sent": False,
                 }
-                send_discord_alert({
-                    "username": f"{CONFIG.spy} Options Bot",
-                    "content": (
-                        f"📋 **Paper Trade Started** — tracking this position automatically\n"
-                        f"**{CONFIG.spy} ${trade.strike:.0f} {trade.option_type}** | Entry: **${trade.ask_price:.2f}**\n"
-                        f"✅ Take profit alert at: **${trade.ask_price * 1.5:.2f}** (+50%)\n"
-                        f"🛑 Stop loss alert at: **${trade.ask_price * 0.5:.2f}** (-50%)\n"
-                        f"I'll update you every 30 min until you exit 👀"
-                    )
-                })
 
                 if signal.signal in ("BUY_CALL", "BUY_CALL_SPREAD"):
                     _current_position = "long_call"
@@ -678,7 +668,7 @@ def start_scheduler() -> None:
     scheduler.add_job(run_position_monitor, trigger=IntervalTrigger(minutes=30),
                       id="position_monitor", max_instances=1, coalesce=True, misfire_grace_time=60)
 
-    scheduler.add_job(run_trend_update, trigger=IntervalTrigger(hours=1),
+    scheduler.add_job(run_trend_update, trigger=IntervalTrigger(minutes=30),
                       id="trend_update", max_instances=1, coalesce=True, misfire_grace_time=120)
 
     scheduler.add_job(run_premarket_alert, trigger=CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET),
