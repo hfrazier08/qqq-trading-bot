@@ -35,6 +35,9 @@ _daily_stats = {
     "milestone_70_sent": False,
 }
 
+# Tracks last 5 confidence readings to show trend momentum
+_confidence_history: list = []
+
 # ── Active paper trade (set when a real signal fires) ──
 # {ticker, direction, strike, expiration, entry_price, contracts,
 #  total_cost, entry_time, profit_target, stop_loss_price,
@@ -232,10 +235,11 @@ def run_premarket_alert() -> None:
 # OPENING BELL — 9:30 AM ET
 # ─────────────────────────────────────────────
 def run_opening_bell() -> None:
-    global _daily_stats
+    global _daily_stats, _confidence_history
     if datetime.now(ET).weekday() >= 5:
         return
     _daily_stats = {"scans": 0, "highest_confidence": 0, "trades_fired": 0, "open_price": None, "milestone_70_sent": False}
+    _confidence_history = []
     try:
         snapshot = fetch_market_snapshot()
         _daily_stats["open_price"] = snapshot.spy_price
@@ -257,7 +261,7 @@ def run_opening_bell() -> None:
 # MAIN SCAN CYCLE — every 20 min
 # ─────────────────────────────────────────────
 def run_scan_cycle() -> None:
-    global _current_position, _daily_stats, _active_paper_trade
+    global _current_position, _daily_stats, _active_paper_trade, _confidence_history
 
     if not is_market_open():
         logger.debug("Market closed — skipping scan")
@@ -272,6 +276,9 @@ def run_scan_cycle() -> None:
         _daily_stats["scans"] += 1
         if signal.confidence > _daily_stats["highest_confidence"]:
             _daily_stats["highest_confidence"] = signal.confidence
+        _confidence_history.append(signal.confidence)
+        if len(_confidence_history) > 5:
+            _confidence_history.pop(0)
         if _daily_stats["open_price"] is None:
             _daily_stats["open_price"] = snapshot.spy_price
 
@@ -382,11 +389,30 @@ def run_trend_update() -> None:
         bar = "🟩" * filled + "⬜" * (10 - filled)
         now_et = datetime.now(ET).strftime("%I:%M %p ET")
 
+        # Build confidence trend line from history
+        if len(_confidence_history) >= 2:
+            history_str = " → ".join(f"**{c}%**" for c in _confidence_history)
+            delta = _confidence_history[-1] - _confidence_history[-2]
+            if delta >= 5:
+                trend_arrow = "📈 Rising fast"
+            elif delta >= 1:
+                trend_arrow = "↗️ Rising"
+            elif delta <= -5:
+                trend_arrow = "📉 Dropping fast"
+            elif delta <= -1:
+                trend_arrow = "↘️ Falling"
+            else:
+                trend_arrow = "➡️ Holding steady"
+            trend_line = f"Confidence: {history_str} — {trend_arrow}"
+        else:
+            trend_line = f"Confidence: **{conf}%**"
+
         send_discord_alert({
             "username": f"{CONFIG.spy} Options Bot",
             "content": (
                 f"{emoji} **{trend}** — {now_et}\n"
-                f"**{CONFIG.spy}:** ${price:.2f}  |  **VIX:** {vix:.2f}  |  **Confidence:** {conf}%\n"
+                f"**{CONFIG.spy}:** ${price:.2f}  |  **VIX:** {vix:.2f}\n"
+                f"{trend_line}\n"
                 f"{bar}\n"
                 f"📌 {action.capitalize()}"
             )
