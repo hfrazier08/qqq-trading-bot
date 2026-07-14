@@ -8,6 +8,7 @@ Options Flow & Smart Money Tracker
 """
 
 import logging
+import os
 import requests
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
@@ -18,7 +19,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-FLOW_WEBHOOK_URL = "https://discord.com/api/webhooks/1510817097159151656/3m4776CwYjFJoQ8mhGR67HCmqZu9fs82gLR9X0iKikDB5Iox_07sukVvjXTic_KEg-5Y"
+FLOW_WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
 FLOW_TICKERS = ["SPY", "QQQ"]
 
 MIN_VOLUME_OI_RATIO = 2.0
