@@ -135,7 +135,7 @@ def update_trade_exit(
             logger.warning(f"Trade {trade_id} not found for exit update")
             return
         entry_debit, max_profit, contracts = row
-        pnl_per_contract = entry_debit - exit_debit   # positive = profit for debit spread
+        pnl_per_contract = exit_debit - entry_debit   # positive = profit (bought at entry_debit, exiting at exit_debit)
         pnl_dollars = round(pnl_per_contract * contracts * 100, 2)
         pnl_pct = round(pnl_per_contract / entry_debit * 100, 2) if entry_debit > 0 else 0
         outcome = "win" if pnl_dollars > 0 else ("loss" if pnl_dollars < 0 else "breakeven")

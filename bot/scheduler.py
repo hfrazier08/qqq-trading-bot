@@ -19,7 +19,7 @@ from bot.signal_generator import generate_signal, HOLD
 from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
-from bot.trade_logger import init_db, log_signal, log_trade_entry
+from bot.trade_logger import init_db, log_signal, log_trade_entry, update_trade_exit
 # Flow/sentiment handled by SPY bot only — not imported here
 
 logger = logging.getLogger(__name__)
@@ -83,7 +83,9 @@ def _get_snapshot_and_signal():
 
 
 def _fetch_current_option_price(ticker: str, expiration: str, strike: float, option_type: str) -> Optional[float]:
-    """Fetch the current mid price of a specific option from yfinance."""
+    """Fetch the current *sellable* price of a specific option — the bid,
+    since that's what you'd actually receive selling to close. Falls back
+    to the bid/ask midpoint only when there's no live bid, then lastPrice."""
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiration)
@@ -93,6 +95,8 @@ def _fetch_current_option_price(ticker: str, expiration: str, strike: float, opt
             return None
         bid = float(row.iloc[0].get("bid", 0) or 0)
         ask = float(row.iloc[0].get("ask", 0) or 0)
+        if bid > 0:
+            return round(bid, 2)
         if ask > 0:
             return round((bid + ask) / 2, 2)
         return float(row.iloc[0].get("lastPrice", 0) or 0)
@@ -154,6 +158,8 @@ def run_position_monitor() -> None:
         _active_paper_trade["pnl"] = pnl
         _active_paper_trade["pnl_pct"] = round(pct_change, 1)
         _active_paper_trade["outcome"] = "win"
+        if trade.get("trade_id"):
+            update_trade_exit(trade["trade_id"], exit_debit=current_price, exit_reason="take_profit")
         _save_paper_trade(_active_paper_trade)
         _active_paper_trade = None
         logger.info("Take profit alert sent — paper trade closed")
@@ -179,6 +185,8 @@ def run_position_monitor() -> None:
         _active_paper_trade["pnl"] = pnl
         _active_paper_trade["pnl_pct"] = round(pct_change, 1)
         _active_paper_trade["outcome"] = "loss"
+        if trade.get("trade_id"):
+            update_trade_exit(trade["trade_id"], exit_debit=current_price, exit_reason="stop_loss")
         _save_paper_trade(_active_paper_trade)
         _active_paper_trade = None
         logger.info("Stop loss alert sent — paper trade closed")
@@ -356,7 +364,9 @@ def run_scan_cycle() -> None:
 
         signal_id = log_signal(signal, snapshot.spy_price, snapshot.vix_current, options.iv_rank, macro.breadth_pct, alert_sent=alert_sent)
         if trade and alert_sent:
-            log_trade_entry(signal_id, trade)
+            trade_id = log_trade_entry(signal_id, trade)
+            if _active_paper_trade is not None:
+                _active_paper_trade["trade_id"] = trade_id
 
     except Exception as e:
         logger.exception(f"Scan cycle error: {e}")

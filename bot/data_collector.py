@@ -42,11 +42,11 @@ def fetch_market_snapshot() -> MarketSnapshot:
     spy_1wk = _retry(lambda: _fetch_history(spy, period="3y", interval="1wk"))
     spy_4h = _resample_to_4h(spy_1h)
 
-    spy_price = float(spy_1d["Close"].dropna().iloc[-1])
+    spy_price = _fetch_live_price(spy, spy_1d)
 
     vix = yf.Ticker(CONFIG.vix)
     vix_1d = _retry(lambda: _fetch_history(vix, period="1y", interval="1d"))
-    vix_current = float(vix_1d["Close"].dropna().iloc[-1])
+    vix_current = _fetch_live_price(vix, vix_1d)
 
     sector_data = _retry(lambda: _fetch_sector_etfs())
     tlt_1d = sector_data.pop("TLT", pd.DataFrame())
@@ -74,6 +74,19 @@ def fetch_market_snapshot() -> MarketSnapshot:
         options_puts=puts,
         available_expirations=expirations,
     )
+
+
+def _fetch_live_price(ticker: yf.Ticker, fallback_df: pd.DataFrame) -> float:
+    """Prefer a live/last quote over the (possibly several-minutes-delayed)
+    daily bar close. fast_info pulls a near-real-time last price; the daily
+    bar is only used if that lookup fails entirely."""
+    try:
+        last = ticker.fast_info.get("lastPrice")
+        if last:
+            return float(last)
+    except Exception as e:
+        logger.warning(f"Live price lookup failed, falling back to daily close: {e}")
+    return float(fallback_df["Close"].dropna().iloc[-1])
 
 
 def _fetch_spy_1h(ticker: yf.Ticker) -> pd.DataFrame:
