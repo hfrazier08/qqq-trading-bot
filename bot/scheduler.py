@@ -15,7 +15,7 @@ from bot.data_collector import fetch_market_snapshot
 from bot.technical_analysis import compute_technical_signals
 from bot.options_analyzer import analyze_options
 from bot.macro_analyzer import analyze_macro
-from bot.signal_generator import generate_signal, HOLD
+from bot.signal_generator import generate_signal, HOLD, BUY_CALL, BUY_PUT, EXIT_LONG, EXIT_SHORT
 from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
@@ -58,7 +58,18 @@ def _load_paper_trades() -> list:
 
 
 def _save_paper_trade(record: dict) -> None:
+    """Insert a new paper trade, or update an existing one in place (matched
+    by trade_id) so a trade logged as 'open' when it's fired gets its exit
+    filled in rather than duplicated when it later closes."""
     trades = _load_paper_trades()
+    trade_id = record.get("trade_id")
+    if trade_id is not None:
+        for i, t in enumerate(trades):
+            if t.get("trade_id") == trade_id:
+                trades[i] = record
+                with open(PAPER_TRADE_LOG, "w") as f:
+                    json.dump(trades, f, indent=2)
+                return
     trades.append(record)
     with open(PAPER_TRADE_LOG, "w") as f:
         json.dump(trades, f, indent=2)
@@ -109,7 +120,7 @@ def _fetch_current_option_price(ticker: str, expiration: str, strike: float, opt
 # STOP LOSS / TAKE PROFIT MONITOR — every 30 min
 # ─────────────────────────────────────────────
 def run_position_monitor() -> None:
-    global _active_paper_trade
+    global _active_paper_trade, _current_position
 
     if not is_market_open() or _active_paper_trade is None:
         return
@@ -162,6 +173,7 @@ def run_position_monitor() -> None:
             update_trade_exit(trade["trade_id"], exit_debit=current_price, exit_reason="take_profit")
         _save_paper_trade(_active_paper_trade)
         _active_paper_trade = None
+        _current_position = None
         logger.info("Take profit alert sent — paper trade closed")
         return
 
@@ -189,6 +201,7 @@ def run_position_monitor() -> None:
             update_trade_exit(trade["trade_id"], exit_debit=current_price, exit_reason="stop_loss")
         _save_paper_trade(_active_paper_trade)
         _active_paper_trade = None
+        _current_position = None
         logger.info("Stop loss alert sent — paper trade closed")
         return
 
@@ -314,8 +327,14 @@ def run_scan_cycle() -> None:
 
         alert_sent = False
         trade = None
+        is_exit_signal = signal.signal in (EXIT_LONG, EXIT_SHORT)
 
-        if signal.signal != HOLD:
+        if is_exit_signal:
+            # ── SELL fired: close the existing open position, don't open a new one ──
+            alert_sent = _handle_exit_signal(signal, snapshot.spy_price)
+            _current_position = None
+
+        elif signal.signal != HOLD:
             trade = construct_trade(
                 signal_direction=signal.direction,
                 spy_price=snapshot.spy_price,
@@ -353,23 +372,84 @@ def run_scan_cycle() -> None:
                     "confidence": signal.confidence,
                     "tp_alert_sent": False,
                     "sl_alert_sent": False,
+                    "outcome": "open",
                 }
 
-                if signal.signal in ("BUY_CALL", "BUY_CALL_SPREAD"):
-                    _current_position = "long_call"
-                elif signal.signal in ("BUY_PUT", "BUY_PUT_SPREAD"):
-                    _current_position = "long_put"
-                elif signal.signal in ("EXIT_LONG", "EXIT_SHORT"):
-                    _current_position = None
+                if signal.signal == BUY_CALL:
+                    _current_position = "long_call_spread"
+                elif signal.signal == BUY_PUT:
+                    _current_position = "long_put_spread"
 
         signal_id = log_signal(signal, snapshot.spy_price, snapshot.vix_current, options.iv_rank, macro.breadth_pct, alert_sent=alert_sent)
         if trade and alert_sent:
             trade_id = log_trade_entry(signal_id, trade)
             if _active_paper_trade is not None:
                 _active_paper_trade["trade_id"] = trade_id
+                # Persist immediately as an open position so the daily/weekly
+                # money report reflects the fired trade the moment it's sent,
+                # not only once (if ever) it happens to close.
+                _save_paper_trade(_active_paper_trade)
 
     except Exception as e:
         logger.exception(f"Scan cycle error: {e}")
+
+
+def _handle_exit_signal(signal, spy_price: float) -> bool:
+    """Handles a SELL/EXIT alert firing: closes out the currently open paper
+    trade at its real current price, logs the actual entry-to-exit P&L (so
+    the daily money report reflects it), and sends an accurate exit alert —
+    instead of the old behavior of constructing and alerting a brand new
+    fake trade in the exit direction."""
+    global _active_paper_trade
+
+    if _active_paper_trade is None:
+        logger.warning(f"{signal.signal} fired but no open paper trade to close — skipping")
+        return False
+
+    trade = _active_paper_trade
+    current_price = _fetch_current_option_price(
+        trade["ticker"], trade["expiration"], trade["strike"], trade["direction"]
+    )
+    if current_price is None:
+        logger.warning("Exit signal: could not fetch current option price — leaving trade open")
+        return False
+
+    entry = trade["entry_price"]
+    pct_change = ((current_price - entry) / entry) * 100 if entry else 0
+    contracts = trade["contracts"]
+    current_value = round(current_price * contracts * 100, 2)
+    pnl = round(current_value - trade["total_cost"], 2)
+    outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven")
+    option_type = "Call" if trade["direction"] == "call" else "Put"
+    ticker = trade["ticker"]
+    strike = trade["strike"]
+    now_et = datetime.now(ET).strftime("%I:%M %p ET")
+
+    emoji = "🟠"
+    pnl_emoji = "💰" if pnl >= 0 else "📉"
+    send_discord_alert({
+        "username": f"{ticker} Options Bot",
+        "content": (
+            f"{emoji} **{ticker} {signal.signal.replace('_', ' ')} — SELL SIGNAL FIRED**\n"
+            f"**{ticker} ${strike:.0f} {option_type}** | Entry: ${entry:.2f} → Exit: **${current_price:.2f}** ({pct_change:+.1f}%)\n"
+            f"{pnl_emoji} **P&L: {'+' if pnl >= 0 else ''}${pnl:,.0f}** on {contracts} contract(s)\n"
+            f"📋 Go to Robinhood → find your {ticker} ${strike:.0f} {option_type} → **Sell to Close**\n"
+            f"⏰ {now_et} — conditions reversed, exit the position now."
+        )
+    })
+
+    trade["exit_price"] = current_price
+    trade["exit_time"] = now_et
+    trade["exit_reason"] = "signal_exit"
+    trade["pnl"] = pnl
+    trade["pnl_pct"] = round(pct_change, 1)
+    trade["outcome"] = outcome
+    if trade.get("trade_id"):
+        update_trade_exit(trade["trade_id"], exit_debit=current_price, exit_reason="signal_exit")
+    _save_paper_trade(trade)
+    _active_paper_trade = None
+    logger.info(f"Exit signal closed paper trade — outcome={outcome} pnl=${pnl:,.2f}")
+    return True
 
 
 # ─────────────────────────────────────────────
