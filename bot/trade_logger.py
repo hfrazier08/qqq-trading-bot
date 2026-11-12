@@ -2,13 +2,17 @@ import json
 import logging
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
+
+from bot.config import CONFIG, DATA_DIR
 
 from bot.signal_generator import TradingSignal
 from bot.trade_constructor import SingleLegTrade
 
 logger = logging.getLogger(__name__)
-DB_PATH = "qqq_trades.db"
+# absolute + per-ticker so the bot works no matter what directory launchd starts it from
+DB_PATH = str(DATA_DIR / f"{CONFIG.spy.lower()}_trades.db")
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS signals (
@@ -135,7 +139,9 @@ def update_trade_exit(
             logger.warning(f"Trade {trade_id} not found for exit update")
             return
         entry_debit, max_profit, contracts = row
-        pnl_per_contract = entry_debit - exit_debit   # positive = profit for debit spread
+        # Long option: we paid entry_debit and sell for exit_debit -> profit = exit - entry.
+        # (was entry - exit, which flipped every win into a loss and vice versa)
+        pnl_per_contract = exit_debit - entry_debit
         pnl_dollars = round(pnl_per_contract * contracts * 100, 2)
         pnl_pct = round(pnl_per_contract / entry_debit * 100, 2) if entry_debit > 0 else 0
         outcome = "win" if pnl_dollars > 0 else ("loss" if pnl_dollars < 0 else "breakeven")

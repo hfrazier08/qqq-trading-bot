@@ -42,7 +42,10 @@ def fetch_market_snapshot() -> MarketSnapshot:
     spy_1wk = _retry(lambda: _fetch_history(spy, period="3y", interval="1wk"))
     spy_4h = _resample_to_4h(spy_1h)
 
-    spy_price = float(spy_1d["Close"].dropna().iloc[-1])
+    try:
+        spy_price = float(spy.fast_info["lastPrice"])
+    except Exception:
+        spy_price = float(spy_1h["Close"].dropna().iloc[-1])
 
     vix = yf.Ticker(CONFIG.vix)
     vix_1d = _retry(lambda: _fetch_history(vix, period="1y", interval="1d"))
@@ -115,8 +118,16 @@ def _fetch_sector_etfs() -> Dict[str, pd.DataFrame]:
                 df.index = df.index.tz_convert("America/New_York").tz_localize(None)
             result[t] = df
         except (KeyError, TypeError):
-            logger.warning(f"No data for {t}")
             result[t] = pd.DataFrame()
+        if result[t].empty:
+            # bulk download occasionally returns nothing for some tickers; retry one by one
+            try:
+                df = _normalize_df(yf.Ticker(t).history(period="1y", interval="1d"))
+                result[t] = df.dropna() if not df.empty else df
+            except Exception:
+                pass
+            if result[t].empty:
+                logger.warning(f"No data for {t}")
     return result
 
 

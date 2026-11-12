@@ -13,17 +13,11 @@ import sys
 
 from bot.config import CONFIG
 from bot.trade_logger import get_win_rate_summary, init_db
+from bot import logger as log
 
 
 def setup_logging() -> None:
-    level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
-    fmt = "%(asctime)s [%(levelname)-8s] %(name)s — %(message)s"
-    handlers = [
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("qqq_bot.log", encoding="utf-8"),
-    ]
-    logging.basicConfig(level=level, format=fmt, handlers=handlers)
-    # Quiet noisy third-party loggers
+    # Quiet noisy third-party loggers; bot modules use bot.logger directly
     logging.getLogger("yfinance").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("apscheduler").setLevel(logging.WARNING)
@@ -63,9 +57,11 @@ if __name__ == "__main__":
         sys.exit(0)
 
     print_banner()
+    log.main.info("QQQ bot starting — logs in qqq_trading_bot/logs/")
 
     from bot.scheduler import start_scheduler
     try:
         start_scheduler()
     except (KeyboardInterrupt, SystemExit):
+        log.main.info("Bot stopped.")
         print("\nBot stopped.")

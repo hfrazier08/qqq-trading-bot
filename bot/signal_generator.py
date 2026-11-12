@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 from datetime import datetime
@@ -8,8 +7,7 @@ import pytz
 from bot.technical_analysis import TechnicalSignals
 from bot.options_analyzer import OptionsAnalysis
 from bot.macro_analyzer import MacroSignals
-
-logger = logging.getLogger(__name__)
+from bot import logger as log
 
 ET = pytz.timezone("America/New_York")
 
@@ -39,6 +37,12 @@ _last_signal_time: Optional[datetime] = None
 _last_confidence: int = 0
 
 
+def reset_cooldown() -> None:
+    """Call when a fired signal was NOT delivered so the next scan can fire it again."""
+    global _last_signal, _last_signal_time, _last_confidence
+    _last_signal, _last_signal_time, _last_confidence = None, None, 0
+
+
 def generate_signal(
     technical: TechnicalSignals,
     macro: MacroSignals,
@@ -46,7 +50,9 @@ def generate_signal(
     threshold: int = 75,
     current_position: Optional[str] = None,
     spy_price: float = 0.0,
+    dry_run: bool = False,
 ) -> TradingSignal:
+    """dry_run=True evaluates without touching cooldown state (used by status/trend updates)."""
     global _last_signal, _last_signal_time, _last_confidence
 
     tech_score = technical.technical_score   # 0-50
@@ -71,12 +77,24 @@ def generate_signal(
         if total < 40 and tech_bias == "bullish":
             return _make_signal(EXIT_SHORT, "bullish", total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
 
+    # Always log score progress so you can watch confidence approach threshold
+    _log_score(total, tech_score, macro_score, opts_score, threshold, layers_agree, tech_bias, macro_bias)
+
     # Panic — don't open new positions
     if macro.vix_regime == "panic":
         reasons.insert(0, f"HOLD — VIX in panic regime ({macro.vix_current:.1f})")
+        log.signals.warning(f"VIX PANIC regime ({macro.vix_current:.1f}) — no new positions")
         return _make_signal(HOLD, "neutral", total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
 
     if total < threshold or not layers_agree:
+        gap = threshold - total
+        if not layers_agree:
+            log.signals.info(
+                f"HOLD — layers disagree (tech={tech_bias} macro={macro_bias}) | "
+                f"conf={total}/100 (need {threshold})"
+            )
+        else:
+            log.signals.info(f"HOLD — conf={total}/100 | {gap} pts below threshold ({threshold})")
         return _make_signal(HOLD, tech_bias if tech_bias != "neutral" else "neutral", total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
 
     # Determine direction
@@ -85,20 +103,44 @@ def generate_signal(
 
     # Cooldown: suppress identical signal within cooldown window unless confidence jumped
     now = datetime.now(ET)
+    if dry_run:
+        return _make_signal(signal, direction, total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
     if (
         _last_signal == signal
         and _last_signal_time is not None
         and (now - _last_signal_time).total_seconds() < 7200  # 2 hours
         and (total - _last_confidence) < 10
     ):
-        logger.info(f"Cooldown active — suppressing {signal} (conf={total})")
+        log.signals.info(f"Cooldown active — suppressing {signal} (conf={total}, last={_last_confidence})")
         return _make_signal(HOLD, direction, total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
 
     _last_signal = signal
     _last_signal_time = now
     _last_confidence = total
 
+    icon = "🟢" if signal == BUY_CALL else "🔴"
+    log.signals.info(
+        f"{icon} FIRED {signal} | conf={total}/100 "
+        f"(tech={tech_score} macro={macro_score} opts={opts_score}) | "
+        f"direction={direction} risk={risk_level}"
+    )
+
     return _make_signal(signal, direction, total, tech_score, macro_score, opts_score, reasons, risk_level, spy_price)
+
+
+def _log_score(
+    total: int, tech: int, macro: int, opts: int,
+    threshold: int, layers_agree: bool,
+    tech_bias: str, macro_bias: str,
+) -> None:
+    filled = int(total / 100 * 20)
+    bar = ("█" * filled) + ("░" * (20 - filled))
+    agree_str = "layers-agree" if layers_agree else f"layers-DISAGREE(tech={tech_bias}/macro={macro_bias})"
+    log.signals.info(
+        f"Confidence [{bar}] {total}/100 | "
+        f"tech={tech}/50 macro={macro}/30 opts={opts}/20 | "
+        f"threshold={threshold} | {agree_str}"
+    )
 
 
 def _make_signal(

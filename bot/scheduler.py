@@ -1,7 +1,9 @@
 import json
 import logging
 import os
-from datetime import datetime
+import time
+from datetime import datetime, date
+from pathlib import Path
 from typing import Optional
 
 import pytz
@@ -10,16 +12,16 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from apscheduler.triggers.cron import CronTrigger
 
-from bot.config import CONFIG
+from bot.config import CONFIG, DATA_DIR
 from bot.data_collector import fetch_market_snapshot
 from bot.technical_analysis import compute_technical_signals
 from bot.options_analyzer import analyze_options
 from bot.macro_analyzer import analyze_macro
-from bot.signal_generator import generate_signal, HOLD
+from bot.signal_generator import generate_signal, reset_cooldown, HOLD, EXIT_LONG, EXIT_SHORT
 from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
-from bot.trade_logger import init_db, log_signal, log_trade_entry
+from bot.trade_logger import init_db, log_signal, log_trade_entry, update_trade_exit
 # Flow/sentiment handled by SPY bot only — not imported here
 
 logger = logging.getLogger(__name__)
@@ -36,12 +38,18 @@ _daily_stats = {
 }
 
 # ── Active paper trade (set when a real signal fires) ──
-# {ticker, direction, strike, expiration, entry_price, contracts,
-#  total_cost, entry_time, profit_target, stop_loss_price,
-#  tp_alert_sent, sl_alert_sent}
+# {ticker, direction, strike, expiration, entry_price, contracts, total_cost,
+#  entry_time, profit_target, stop_loss_price, confidence, db_trade_id, ...}
+# Persisted to disk so a restart / sleep / crash never forgets an open position.
 _active_paper_trade: Optional[dict] = None
 
-PAPER_TRADE_LOG = "paper_trades.json"
+PAPER_TRADE_LOG = str(DATA_DIR / "paper_trades.json")      # closed trades (the win/loss ledger)
+ACTIVE_TRADE_FILE = str(DATA_DIR / "active_trade.json")    # the one open trade, if any
+
+TP_PCT = 50.0    # take profit at +50% on the option premium
+SL_PCT = -50.0   # stop loss at -50%
+
+_monitor_ticks = 0   # position monitor runs every 5 min; user-facing update every 6th tick (30 min)
 
 
 def _load_paper_trades() -> list:
@@ -50,15 +58,80 @@ def _load_paper_trades() -> list:
             with open(PAPER_TRADE_LOG) as f:
                 return json.load(f)
         except Exception:
-            pass
+            logger.exception("Could not read paper trade ledger")
     return []
 
 
 def _save_paper_trade(record: dict) -> None:
     trades = _load_paper_trades()
     trades.append(record)
-    with open(PAPER_TRADE_LOG, "w") as f:
+    tmp = PAPER_TRADE_LOG + ".tmp"
+    with open(tmp, "w") as f:
         json.dump(trades, f, indent=2)
+    os.replace(tmp, PAPER_TRADE_LOG)
+
+
+def _persist_active_trade() -> None:
+    if _active_paper_trade is None:
+        if os.path.exists(ACTIVE_TRADE_FILE):
+            os.remove(ACTIVE_TRADE_FILE)
+        return
+    with open(ACTIVE_TRADE_FILE, "w") as f:
+        json.dump(_active_paper_trade, f, indent=2)
+
+
+def _restore_active_trade() -> None:
+    global _active_paper_trade, _current_position
+    if not os.path.exists(ACTIVE_TRADE_FILE):
+        return
+    try:
+        with open(ACTIVE_TRADE_FILE) as f:
+            _active_paper_trade = json.load(f)
+        _current_position = _position_label(_active_paper_trade["direction"])
+        t = _active_paper_trade
+        logger.info(f"Restored open paper trade: {t['ticker']} ${t['strike']:.0f} {t['direction']} "
+                    f"exp {t['expiration']} entry ${t['entry_price']:.2f}")
+    except Exception:
+        logger.exception("Could not restore active trade")
+        _active_paper_trade = None
+
+
+def _position_label(direction: str) -> str:
+    # names must match what signal_generator's EXIT logic looks for
+    return "long_call_spread" if direction == "call" else "long_put_spread"
+
+
+def _close_paper_trade(exit_price: float, reason: str) -> dict:
+    """Single place where a trade closes: computes P&L, win/loss, writes ledger + DB, clears state."""
+    global _active_paper_trade, _current_position
+    t = _active_paper_trade
+    entry = t["entry_price"]
+    contracts = t["contracts"]
+    pnl = round((exit_price - entry) * contracts * 100, 2)      # long option: exit - entry
+    pnl_pct = round((exit_price - entry) / entry * 100, 1) if entry else 0.0
+    outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven")
+    now = datetime.now(ET)
+    t.update({
+        "exit_price": exit_price,
+        "exit_time": now.strftime("%Y-%m-%d %I:%M %p ET"),
+        "exit_date": now.strftime("%Y-%m-%d"),
+        "exit_reason": reason,
+        "pnl": pnl,
+        "pnl_pct": pnl_pct,
+        "outcome": outcome,
+    })
+    _save_paper_trade(t)
+    if t.get("db_trade_id"):
+        try:
+            update_trade_exit(t["db_trade_id"], exit_price, reason)
+        except Exception:
+            logger.exception("Could not update trade exit in DB")
+    closed = t
+    _active_paper_trade = None
+    _current_position = None
+    _persist_active_trade()
+    logger.info(f"Paper trade closed: {reason} | {outcome.upper()} | ${pnl:+,.2f} ({pnl_pct:+.1f}%)")
+    return closed
 
 
 def is_market_open() -> bool:
@@ -70,13 +143,42 @@ def is_market_open() -> bool:
     return open_time <= now <= close_time
 
 
-def _get_snapshot_and_signal():
+def _get_snapshot_and_signal(dry_run: bool = False):
     snapshot = fetch_market_snapshot()
     technical = compute_technical_signals(snapshot.spy_1h, snapshot.spy_1d, snapshot.spy_1wk, snapshot.spy_price)
     macro = analyze_macro(snapshot.vix_current, snapshot.vix_1d, snapshot.sector_etf_prices, snapshot.tlt_1d, snapshot.uup_1d)
     options = analyze_options(snapshot.options_calls, snapshot.options_puts, snapshot.spy_price, snapshot.available_expirations, snapshot.vix_1d)
-    signal = generate_signal(technical, macro, options, threshold=CONFIG.confidence_threshold, current_position=_current_position, spy_price=snapshot.spy_price)
+    signal = generate_signal(technical, macro, options, threshold=CONFIG.confidence_threshold, current_position=_current_position, spy_price=snapshot.spy_price, dry_run=dry_run)
     return snapshot, technical, macro, options, signal
+
+
+def _refresh_trade_prices(trade) -> None:
+    """Re-fetch live bid/ask for the selected contract and update the trade in place."""
+    try:
+        t = yf.Ticker(CONFIG.spy)
+        chain = t.option_chain(trade.expiration)
+        df = chain.calls if trade.direction == "call" else chain.puts
+        row = df[df["strike"] == trade.strike]
+        if row.empty:
+            logger.warning("Price refresh: strike not found in chain")
+            return
+        ask = float(row.iloc[0].get("ask", 0) or 0)
+        bid = float(row.iloc[0].get("bid", 0) or 0)
+        if ask <= 0:
+            logger.warning("Price refresh: ask is 0, keeping original prices")
+            return
+        trade.ask_price = round(ask, 2)
+        trade.bid_price = round(bid, 2)
+        trade.mid_price = round((ask + bid) / 2, 2)
+        trade.cost_per_contract = round(ask * 100, 2)
+        trade.total_cost = round(trade.contracts * trade.cost_per_contract, 2)
+        trade.breakeven = round(trade.strike + ask, 2) if trade.direction == "call" else round(trade.strike - ask, 2)
+        trade.profit_target = round(trade.breakeven + ask * 0.5, 2) if trade.direction == "call" else round(trade.breakeven - ask * 0.5, 2)
+        trade.stop_loss_price = round(ask * 0.5, 2)
+        trade.risk_pct_used = round(trade.total_cost / trade.account_size * 100, 2)
+        logger.info(f"Price refresh: {CONFIG.spy} ${trade.strike:.0f} {trade.direction} → ask=${ask:.2f} bid=${bid:.2f}")
+    except Exception as e:
+        logger.warning(f"Price refresh failed (using snapshot prices): {e}")
 
 
 def _fetch_current_option_price(ticker: str, expiration: str, strike: float, option_type: str) -> Optional[float]:
@@ -99,98 +201,82 @@ def _fetch_current_option_price(ticker: str, expiration: str, strike: float, opt
 
 
 # ─────────────────────────────────────────────
-# STOP LOSS / TAKE PROFIT MONITOR — every 30 min
+# STOP LOSS / TAKE PROFIT MONITOR — every 5 min
 # ─────────────────────────────────────────────
+def _exit_alert(kind: str, trade: dict, current: float) -> None:
+    ticker, strike = trade["ticker"], trade["strike"]
+    option_type = "Call" if trade["direction"] == "call" else "Put"
+    pnl, pct = trade["pnl"], trade["pnl_pct"]
+    now_et = datetime.now(ET).strftime("%I:%M %p ET")
+    head = {
+        "take_profit": f"🚨 **EXIT NOW — TAKE PROFIT!**\n**{ticker} ${strike:.0f} {option_type}** is up **{pct:.0f}%** 🎉",
+        "stop_loss":   f"🛑 **STOP LOSS HIT — EXIT NOW**\n**{ticker} ${strike:.0f} {option_type}** is down **{abs(pct):.0f}%** 📉",
+        "signal_exit": f"🔄 **EXIT SIGNAL — conditions reversed**\n**{ticker} ${strike:.0f} {option_type}** ({pct:+.0f}%)",
+        "expiration":  f"⌛ **OPTION EXPIRING — CLOSE IT**\n**{ticker} ${strike:.0f} {option_type}** ({pct:+.0f}%)",
+    }[kind]
+    pnl_line = f"+${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+    send_discord_alert({
+        "username": f"{ticker} Options Bot",
+        "content": (
+            f"{head}\n"
+            f"Entry: **${trade['entry_price']:.2f}** → Now: **${current:.2f}**\n"
+            f"💰 **P&L: {pnl_line}** on {trade['contracts']} contract(s) — **{trade['outcome'].upper()}**\n"
+            f"📋 Go to Robinhood → find your {ticker} ${strike:.0f} {option_type} → **Sell to Close**\n"
+            f"⏰ {now_et}"
+        )
+    })
+
+
 def run_position_monitor() -> None:
-    global _active_paper_trade
+    global _monitor_ticks
 
     if not is_market_open() or _active_paper_trade is None:
         return
 
     trade = _active_paper_trade
     current_price = _fetch_current_option_price(
-        trade["ticker"], trade["expiration"],
-        trade["strike"], trade["direction"]
+        trade["ticker"], trade["expiration"], trade["strike"], trade["direction"]
     )
-
-    if current_price is None:
-        logger.warning("Position monitor: could not fetch current option price")
+    if current_price is None or current_price <= 0:
+        logger.warning("Position monitor: could not fetch a valid current option price")
         return
 
     entry = trade["entry_price"]
     pct_change = ((current_price - entry) / entry) * 100
     contracts = trade["contracts"]
-    total_cost = trade["total_cost"]
-    current_value = round(current_price * contracts * 100, 2)
-    pnl = round(current_value - total_cost, 2)
+    pnl = round((current_price - entry) * contracts * 100, 2)
     option_type = "Call" if trade["direction"] == "call" else "Put"
-    strike = trade["strike"]
-    ticker = trade["ticker"]
+    strike, ticker = trade["strike"], trade["ticker"]
     now_et = datetime.now(ET).strftime("%I:%M %p ET")
 
-    logger.info(f"Position monitor: {ticker} ${strike} {option_type} | entry=${entry:.2f} current=${current_price:.2f} | {pct_change:+.1f}%")
+    logger.info(f"Position monitor: {ticker} ${strike} {option_type} | entry=${entry:.2f} "
+                f"current=${current_price:.2f} | {pct_change:+.1f}% | P&L ${pnl:+,.2f}")
 
-    # ── TAKE PROFIT: up 50%+ ──
-    if pct_change >= 50 and not trade.get("tp_alert_sent"):
-        _active_paper_trade["tp_alert_sent"] = True
-        send_discord_alert({
-            "username": f"{ticker} Options Bot",
-            "content": (
-                f"🚨 **EXIT NOW — TAKE PROFIT!**\n"
-                f"**{ticker} ${strike:.0f} {option_type}** is up **{pct_change:.0f}%** 🎉\n"
-                f"Entry: **${entry:.2f}** → Now: **${current_price:.2f}**\n"
-                f"💰 **P&L: +${pnl:,.0f}** on {contracts} contract(s)\n"
-                f"📋 Go to Robinhood → find your {ticker} ${strike:.0f} {option_type} → **Sell to Close**\n"
-                f"⏰ {now_et} — don't wait, lock in the profit!"
-            )
-        })
-        # Log closed paper trade
-        _active_paper_trade["exit_price"] = current_price
-        _active_paper_trade["exit_time"] = now_et
-        _active_paper_trade["exit_reason"] = "take_profit"
-        _active_paper_trade["pnl"] = pnl
-        _active_paper_trade["pnl_pct"] = round(pct_change, 1)
-        _active_paper_trade["outcome"] = "win"
-        _save_paper_trade(_active_paper_trade)
-        _active_paper_trade = None
-        logger.info("Take profit alert sent — paper trade closed")
+    reason = None
+    if pct_change >= TP_PCT:
+        reason = "take_profit"
+    elif pct_change <= SL_PCT:
+        reason = "stop_loss"
+    elif date.today().isoformat() >= trade["expiration"]:
+        reason = "expiration"
+
+    if reason:
+        closed = _close_paper_trade(current_price, reason)
+        _exit_alert(reason, closed, current_price)
         return
 
-    # ── STOP LOSS: down 50%+ ──
-    if pct_change <= -50 and not trade.get("sl_alert_sent"):
-        _active_paper_trade["sl_alert_sent"] = True
-        send_discord_alert({
-            "username": f"{ticker} Options Bot",
-            "content": (
-                f"🛑 **STOP LOSS HIT — EXIT NOW**\n"
-                f"**{ticker} ${strike:.0f} {option_type}** is down **{abs(pct_change):.0f}%** 📉\n"
-                f"Entry: **${entry:.2f}** → Now: **${current_price:.2f}**\n"
-                f"💸 **P&L: -${abs(pnl):,.0f}** on {contracts} contract(s)\n"
-                f"📋 Go to Robinhood → find your {ticker} ${strike:.0f} {option_type} → **Sell to Close**\n"
-                f"⏰ {now_et} — exit now to protect remaining capital!"
-            )
-        })
-        _active_paper_trade["exit_price"] = current_price
-        _active_paper_trade["exit_time"] = now_et
-        _active_paper_trade["exit_reason"] = "stop_loss"
-        _active_paper_trade["pnl"] = pnl
-        _active_paper_trade["pnl_pct"] = round(pct_change, 1)
-        _active_paper_trade["outcome"] = "loss"
-        _save_paper_trade(_active_paper_trade)
-        _active_paper_trade = None
-        logger.info("Stop loss alert sent — paper trade closed")
+    # Regular status update every 6th check (30 min) — checks themselves run every 5 min
+    _monitor_ticks += 1
+    if _monitor_ticks % 6:
         return
-
-    # ── Regular update every 30 min ──
-    direction_emoji = "📈" if pct_change >= 0 else "📉"
     send_discord_alert({
         "username": f"{ticker} Options Bot",
         "content": (
-            f"{direction_emoji} **Open Trade Update** — {now_et}\n"
+            f"{'📈' if pct_change >= 0 else '📉'} **Open Trade Update** — {now_et}\n"
             f"**{ticker} ${strike:.0f} {option_type}** | Entry: ${entry:.2f} → Now: **${current_price:.2f}** ({pct_change:+.1f}%)\n"
-            f"P&L: **{'+'if pnl>=0 else ''}${pnl:,.0f}**  |  "
-            f"Take profit at: **${trade['profit_target']:.2f}** (+50%)  |  "
-            f"Stop loss at: **${trade['stop_loss_price']:.2f}** (-50%)"
+            f"P&L: **{'+' if pnl >= 0 else '-'}${abs(pnl):,.0f}**  |  "
+            f"Take profit at: **${entry * (1 + TP_PCT/100):.2f}** (+50%)  |  "
+            f"Stop loss at: **${entry * (1 + SL_PCT/100):.2f}** (-50%)"
         )
     })
 
@@ -245,7 +331,7 @@ def run_opening_bell() -> None:
                 f"🔔 **Market is open! Let's get this money!** 💰\n"
                 f"**{CONFIG.spy}:** ${snapshot.spy_price:.2f}  |  **VIX:** {snapshot.vix_current:.2f}\n"
                 f"Bots are live and scanning every {CONFIG.scan_interval_minutes} minutes. "
-                f"Signal fires at **75%+ confidence** 🚀"
+                f"Signal fires at **{CONFIG.confidence_threshold}%+ confidence** 🚀"
             )
         })
         logger.info("Opening bell sent")
@@ -281,75 +367,106 @@ def run_scan_cycle() -> None:
         )
 
         # ── Confidence milestone at 70% ──
-        if signal.confidence >= 70 and not _daily_stats["milestone_70_sent"]:
+        near = CONFIG.confidence_threshold - 5
+        if near <= signal.confidence < CONFIG.confidence_threshold and not _daily_stats["milestone_70_sent"]:
             _daily_stats["milestone_70_sent"] = True
             filled = int(signal.confidence / 10)
             bar = "🟩" * filled + "⬜" * (10 - filled)
             send_discord_alert({
                 "username": f"{CONFIG.spy} Options Bot",
                 "content": (
-                    f"⚠️ **Getting close! Confidence at {signal.confidence}%** — just {75 - signal.confidence} point(s) from firing!\n"
+                    f"⚠️ **Getting close! Confidence at {signal.confidence}%** — just {CONFIG.confidence_threshold - signal.confidence} point(s) from firing!\n"
                     f"**{CONFIG.spy}:** ${snapshot.spy_price:.2f}  |  **VIX:** {snapshot.vix_current:.2f}\n"
                     f"{bar}\n"
                     f"📌 Stay ready — next scan in {CONFIG.scan_interval_minutes} minutes could send a trade alert! 👀"
                 )
             })
-        if signal.confidence < 68:
+        if signal.confidence < near - 2:
             _daily_stats["milestone_70_sent"] = False
 
         alert_sent = False
         trade = None
+        started_trade = False
 
-        if signal.signal != HOLD:
-            trade = construct_trade(
-                signal_direction=signal.direction,
-                spy_price=snapshot.spy_price,
-                calls=options.best_calls,
-                puts=options.best_puts,
-                expirations=snapshot.available_expirations,
-                account_size=CONFIG.account_size,
-                risk_pct=CONFIG.risk_pct,
-                target_dte_min=CONFIG.target_dte_min,
-                target_dte_max=CONFIG.target_dte_max,
-                signal_timestamp=signal.timestamp,
-                max_spread_width=CONFIG.max_spread_width,
-            )
-            discord_payload = format_discord_embed(signal, trade, snapshot.spy_price)
-            whatsapp_msg = format_whatsapp_message(signal, trade, snapshot.spy_price)
-            results = send_all_alerts(discord_payload, whatsapp_msg)
-            alert_sent = results.get("discord", False)
+        if signal.signal in (EXIT_LONG, EXIT_SHORT):
+            # Reversal exit for the open paper trade (previously this fell into the entry path
+            # and built a brand-new trade).
+            if _active_paper_trade is not None:
+                t = _active_paper_trade
+                px = _fetch_current_option_price(t["ticker"], t["expiration"], t["strike"], t["direction"])
+                if px and px > 0:
+                    closed = _close_paper_trade(px, "signal_exit")
+                    _exit_alert("signal_exit", closed, px)
+                    alert_sent = True
+                else:
+                    logger.warning("Exit signal fired but option price unavailable — monitor will retry")
+            else:
+                _current_position = None
 
-            if alert_sent and trade:
-                _daily_stats["trades_fired"] += 1
-                logger.info(f"Trade alert sent — {signal.signal} conf={signal.confidence}%")
+        elif signal.signal != HOLD:
+            if _active_paper_trade is not None:
+                logger.info(f"{signal.signal} suppressed — a paper trade is already open "
+                            f"({_active_paper_trade['strike']:.0f} {_active_paper_trade['direction']})")
+                reset_cooldown()
+            else:
+                trade = construct_trade(
+                    signal_direction=signal.direction,
+                    spy_price=snapshot.spy_price,
+                    calls=options.best_calls,
+                    puts=options.best_puts,
+                    expirations=snapshot.available_expirations,
+                    account_size=CONFIG.account_size,
+                    risk_pct=CONFIG.risk_pct,
+                    target_dte_min=CONFIG.target_dte_min,
+                    target_dte_max=CONFIG.target_dte_max,
+                    signal_timestamp=signal.timestamp,
+                    max_spread_width=CONFIG.max_spread_width,
+                )
+                if trade is None:
+                    logger.warning(f"{signal.signal} fired but no tradable contract found — will retry next scan")
+                    reset_cooldown()
+                else:
+                    _refresh_trade_prices(trade)
+                    discord_payload = format_discord_embed(signal, trade, snapshot.spy_price)
+                    whatsapp_msg = format_whatsapp_message(signal, trade, snapshot.spy_price)
+                    for attempt in range(1, 4):
+                        alert_sent = send_all_alerts(discord_payload, whatsapp_msg).get("discord", False)
+                        if alert_sent:
+                            break
+                        logger.error(f"Alert delivery failed (attempt {attempt}/3)")
+                        time.sleep(5)
 
-                # ── Start paper trade tracker ──
-                _active_paper_trade = {
-                    "ticker": CONFIG.spy,
-                    "direction": trade.direction,
-                    "strike": trade.strike,
-                    "expiration": trade.expiration,
-                    "entry_price": trade.ask_price,
-                    "contracts": trade.contracts,
-                    "total_cost": trade.total_cost,
-                    "profit_target": trade.ask_price * 1.5,
-                    "stop_loss_price": trade.ask_price * 0.5,
-                    "entry_time": signal.timestamp,
-                    "confidence": signal.confidence,
-                    "tp_alert_sent": False,
-                    "sl_alert_sent": False,
-                }
-
-                if signal.signal in ("BUY_CALL", "BUY_CALL_SPREAD"):
-                    _current_position = "long_call"
-                elif signal.signal in ("BUY_PUT", "BUY_PUT_SPREAD"):
-                    _current_position = "long_put"
-                elif signal.signal in ("EXIT_LONG", "EXIT_SHORT"):
-                    _current_position = None
+                    if not alert_sent:
+                        # Nothing reached the user, so don't count/track a trade they never saw;
+                        # clear the cooldown so the next scan can fire it again.
+                        logger.error("Signal NOT delivered — trade not tracked, cooldown reset")
+                        reset_cooldown()
+                        trade = None
+                    else:
+                        _daily_stats["trades_fired"] += 1
+                        logger.info(f"Trade alert sent — {signal.signal} conf={signal.confidence}%")
+                        _active_paper_trade = {
+                            "ticker": CONFIG.spy,
+                            "direction": trade.direction,
+                            "strike": trade.strike,
+                            "expiration": trade.expiration,
+                            "entry_price": trade.ask_price,
+                            "contracts": trade.contracts,
+                            "total_cost": trade.total_cost,
+                            "profit_target": round(trade.ask_price * (1 + TP_PCT / 100), 2),
+                            "stop_loss_price": round(trade.ask_price * (1 + SL_PCT / 100), 2),
+                            "entry_time": signal.timestamp,
+                            "entry_date": datetime.now(ET).strftime("%Y-%m-%d"),
+                            "confidence": signal.confidence,
+                            "outcome": "open",
+                        }
+                        _current_position = _position_label(trade.direction)
+                        started_trade = True
 
         signal_id = log_signal(signal, snapshot.spy_price, snapshot.vix_current, options.iv_rank, macro.breadth_pct, alert_sent=alert_sent)
-        if trade and alert_sent:
-            log_trade_entry(signal_id, trade)
+        if started_trade:
+            _active_paper_trade["db_trade_id"] = log_trade_entry(signal_id, trade)
+            _persist_active_trade()
 
     except Exception as e:
         logger.exception(f"Scan cycle error: {e}")
@@ -362,7 +479,7 @@ def run_trend_update() -> None:
     if not is_market_open():
         return
     try:
-        snapshot, technical, macro, options, signal = _get_snapshot_and_signal()
+        snapshot, technical, macro, options, signal = _get_snapshot_and_signal(dry_run=True)
         tech = technical.technical_bias
         mac = macro.macro_bias
         conf = signal.confidence
@@ -419,11 +536,11 @@ def run_closing_bell() -> None:
         # Paper trade summary
         paper_trades = _load_paper_trades()
         today = datetime.now(ET).strftime("%Y-%m-%d")
-        todays_trades = [t for t in paper_trades if t.get("entry_time", "").startswith(today)]
+        todays_trades = [t for t in paper_trades if _exit_date(t) == today]
         wins = sum(1 for t in todays_trades if t.get("outcome") == "win")
         losses = sum(1 for t in todays_trades if t.get("outcome") == "loss")
         total_pnl = sum(t.get("pnl", 0) for t in todays_trades)
-        paper_line = f"📊 Paper trades: {wins}W / {losses}L | P&L: {'+'if total_pnl>=0 else ''}${total_pnl:,.0f}" if todays_trades else "📊 No paper trades closed today"
+        paper_line = f"📊 Paper trades closed today: {wins}W / {losses}L | P&L: {'+' if total_pnl >= 0 else '-'}${abs(total_pnl):,.0f}" if todays_trades else "📊 No paper trades closed today"
 
         # Close any open paper trade at end of day
         if _active_paper_trade:
@@ -553,12 +670,17 @@ def run_economic_calendar_check() -> None:
 # ─────────────────────────────────────────────
 # WEEKLY PERFORMANCE REPORT — Friday 4:00 PM
 # ─────────────────────────────────────────────
+def _exit_date(t: dict) -> str:
+    """YYYY-MM-DD a trade closed on. Older ledger rows have no exit_date, so fall back to entry day."""
+    return t.get("exit_date") or str(t.get("entry_time", ""))[:10]
+
+
 def _build_money_report(period: str, trades: list, now_et: datetime) -> str:
     """Shared helper that builds a P&L report string for any period."""
     closed = [t for t in trades if t.get("outcome") in ("win", "loss", "breakeven")]
     wins   = [t for t in closed if t.get("outcome") == "win"]
     losses = [t for t in closed if t.get("outcome") == "loss"]
-    open_t = [t for t in trades if t.get("outcome") == "open"]
+    open_t = [_active_paper_trade] if _active_paper_trade else []
     total_pnl = sum(t.get("pnl", 0) for t in closed)
     win_rate  = round(len(wins) / len(closed) * 100) if closed else 0
     avg_win   = round(sum(t.get("pnl",0) for t in wins)   / len(wins),   2) if wins   else 0
@@ -580,9 +702,9 @@ def _build_money_report(period: str, trades: list, now_et: datetime) -> str:
 
     trade_lines = ""
     for t in closed[-5:]:
-        emoji = "✅" if t.get("outcome") == "win" else "❌"
+        emoji = "✅" if t.get("outcome") == "win" else ("➖" if t.get("outcome") == "breakeven" else "❌")
         pnl   = t.get("pnl", 0)
-        trade_lines += f"{emoji} ${t.get('strike',0):.0f} {t.get('direction','').title()} | {'+'if pnl>=0 else ''}${pnl:,.0f} ({t.get('pnl_pct',0):+.0f}%)\n"
+        trade_lines += f"{emoji} ${t.get('strike',0):.0f} {t.get('direction','').title()} | {'+' if pnl >= 0 else '-'}${abs(pnl):,.0f} ({t.get('pnl_pct',0):+.0f}%)\n"
     if not trade_lines:
         trade_lines = "No closed trades this period\n"
 
@@ -593,10 +715,10 @@ def _build_money_report(period: str, trades: list, now_et: datetime) -> str:
     return (
         f"{ticker_line}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"📊 **Trades:** {len(trades)} fired | {len(closed)} closed | {len(open_t)} open\n"
+        f"📊 **Trades:** {len(closed)} closed | {len(open_t)} open\n"
         f"✅ **Wins:** {len(wins)}  ❌ **Losses:** {len(losses)}  🎯 **Win Rate:** {win_rate}%\n"
         f"💵 **Avg Win:** +${avg_win:,.0f}  |  **Avg Loss:** -${abs(avg_loss):,.0f}\n"
-        f"{pnl_emoji} **Total P&L:** {'+'if total_pnl>=0 else ''}${total_pnl:,.0f} ({pnl_pct:+.1f}% of account)\n"
+        f"{pnl_emoji} **Total P&L:** {'+' if total_pnl >= 0 else '-'}${abs(total_pnl):,.0f} ({pnl_pct:+.1f}% of account)\n"
         f"💼 **Account:** ${account:,.0f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"**Trade breakdown:**\n{trade_lines}"
@@ -610,7 +732,7 @@ def run_weekly_report() -> None:
         now_et = datetime.now(ET)
         week_start_str = (now_et - timedelta(days=now_et.weekday())).strftime("%Y-%m-%d")
         all_trades  = _load_paper_trades()
-        week_trades = [t for t in all_trades if t.get("entry_time", "") >= week_start_str]
+        week_trades = [t for t in all_trades if _exit_date(t) >= week_start_str]
 
         body = _build_money_report("week", week_trades, now_et)
         send_discord_alert({
@@ -636,7 +758,7 @@ def run_daily_money_report() -> None:
         now_et   = datetime.now(ET)
         today    = now_et.strftime("%Y-%m-%d")
         all_trades   = _load_paper_trades()
-        today_trades = [t for t in all_trades if t.get("entry_time", "").startswith(today)]
+        today_trades = [t for t in all_trades if _exit_date(t) == today]
 
         body = _build_money_report("day", today_trades, now_et)
         send_discord_alert({
@@ -660,37 +782,38 @@ def run_daily_money_report() -> None:
 # ─────────────────────────────────────────────
 def start_scheduler() -> None:
     init_db()
+    _restore_active_trade()
     scheduler = BlockingScheduler(timezone=ET)
 
     scheduler.add_job(run_scan_cycle, trigger=IntervalTrigger(minutes=CONFIG.scan_interval_minutes),
-                      id="scan", max_instances=1, coalesce=True, misfire_grace_time=60)
+                      id="scan", max_instances=1, coalesce=True, misfire_grace_time=600)
 
-    scheduler.add_job(run_position_monitor, trigger=IntervalTrigger(minutes=30),
-                      id="position_monitor", max_instances=1, coalesce=True, misfire_grace_time=60)
+    scheduler.add_job(run_position_monitor, trigger=IntervalTrigger(minutes=5),
+                      id="position_monitor", max_instances=1, coalesce=True, misfire_grace_time=300)
 
     scheduler.add_job(run_trend_update, trigger=IntervalTrigger(minutes=30),
-                      id="trend_update", max_instances=1, coalesce=True, misfire_grace_time=120)
+                      id="trend_update", max_instances=1, coalesce=True, misfire_grace_time=600)
 
     scheduler.add_job(run_premarket_alert, trigger=CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET),
-                      id="premarket", max_instances=1)
+                      id="premarket", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     scheduler.add_job(run_opening_bell, trigger=CronTrigger(hour=9, minute=30, day_of_week="mon-fri", timezone=ET),
-                      id="opening_bell", max_instances=1)
+                      id="opening_bell", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     scheduler.add_job(run_closing_bell, trigger=CronTrigger(hour=16, minute=0, day_of_week="mon-fri", timezone=ET),
-                      id="closing_bell", max_instances=1)
+                      id="closing_bell", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     # Economic calendar — every weekday at 8:00 AM ET
     scheduler.add_job(run_economic_calendar_check, trigger=CronTrigger(hour=8, minute=0, day_of_week="mon-fri", timezone=ET),
-                      id="econ_calendar", max_instances=1)
+                      id="econ_calendar", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     # Weekly money report — every Friday at 4:00 PM ET
     scheduler.add_job(run_weekly_report, trigger=CronTrigger(hour=16, minute=0, day_of_week="fri", timezone=ET),
-                      id="weekly_report", max_instances=1)
+                      id="weekly_report", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     # Daily money report — Mon-Thu at 4:01 PM ET
     scheduler.add_job(run_daily_money_report, trigger=CronTrigger(hour=16, minute=1, day_of_week="mon-thu", timezone=ET),
-                      id="daily_money_report", max_instances=1)
+                      id="daily_money_report", max_instances=1, coalesce=True, misfire_grace_time=900)
 
     # NOTE: Flow scan, sentiment reports handled by SPY bot + sentiment bot only
     # QQQ bot only sends to QQQ channel
