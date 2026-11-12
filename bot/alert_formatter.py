@@ -95,6 +95,44 @@ def format_discord_embed(
     }
 
 
+def format_spread_embed(spread, spot: float, ma200: float, timestamp: str) -> dict:
+    """Entry alert for the trend-gated bull call spread (paper trade)."""
+    from bot.spread_strategy import TP_PCT, SL_PCT
+    today = datetime.now(ET).date()
+    exp = datetime.strptime(spread.expiration, "%Y-%m-%d").date()
+    close_by = exp - timedelta(days=CONFIG.expiry_buffer_days)
+    debit = spread.ask_price
+    description = (
+        f"## OPEN {spread.contracts}× {TICKER} ${spread.strike:.0f} / ${spread.short_strike:.0f} CALL SPREAD\n"
+        f"**Buy** the ${spread.strike:.0f} call  ·  **Sell** the ${spread.short_strike:.0f} call  ·  same expiry\n"
+        f"**Expires:** {spread.expiration_label}  ({spread.dte} days)\n"
+        f"**Net price:** ${debit:.2f} per share  →  **${spread.total_cost:,.0f} total**\n"
+        f"**Most you can lose:** ${spread.total_cost:,.0f}  ·  **Most you can make:** "
+        f"${spread.max_profit_per_share * 100 * spread.contracts:,.0f}"
+    )
+    fields = [
+        {"name": "🚪 Exit plan", "value": (
+            (f"✅ **Take profit:** close when the spread is worth **${debit * (1 + TP_PCT / 100):.2f}** (+{TP_PCT:.0f}%)\n"
+               if debit * (1 + TP_PCT / 100) < spread.width * 0.90 else
+               f"ℹ️ **No profit target:** this spread can't reach +{TP_PCT:.0f}% (max value ${spread.width:.2f}) — it exits at the stop or 3 days before expiry\n") +
+            f"🛑 **Stop loss:** close if it falls to **${debit * (1 + SL_PCT / 100):.2f}** ({SL_PCT:.0f}%)\n"
+            f"⌛ **Last day to hold:** **{close_by.strftime('%b %-d')}** (time decay speeds up after that)"), "inline": False},
+        {"name": "📈 Why now", "value": (
+            f"{TICKER} is **above its 200-day average** (${spot:.2f} vs ${ma200:.2f}, {(spot / ma200 - 1) * 100:+.1f}%).\n"
+            f"The rule: hold a bullish spread whenever the trend is up and no trade is open."), "inline": False},
+        {"name": "⚠️ Be realistic", "value": (
+            "This is **market exposure, not a prediction**. In backtests about half of these trades lose, "
+            "and a loss can reach ~70% of the premium. Paper trade only."), "inline": False},
+        {"name": "Details", "value": (
+            f"**Breakeven:** ${spread.breakeven:.2f}  ·  **Spread cost in/out:** ${spread.round_trip_cost:.2f}  ·  "
+            f"**{TICKER}:** ${spot:.2f}"), "inline": False},
+    ]
+    return {"username": f"{TICKER} Options Bot", "embeds": [{
+        "title": f"🟢 {TICKER} BULL CALL SPREAD — trend entry", "description": description,
+        "color": 0x00C851, "fields": fields,
+        "footer": {"text": f"{timestamp} · Paper trade only · Not financial advice"}}]}
+
+
 def format_whatsapp_message(
     signal: TradingSignal,
     trade: Optional[SingleLegTrade],

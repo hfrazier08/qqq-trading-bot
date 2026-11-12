@@ -51,8 +51,8 @@ class BotConfig:
     ])
 
     # Options preferences
-    target_dte_min: int = 7
-    target_dte_max: int = 45
+    target_dte_min: int = int(os.getenv("TARGET_DTE_MIN", 7))
+    target_dte_max: int = int(os.getenv("TARGET_DTE_MAX", 45))
     prefer_weekly_dte: int = 14
     prefer_monthly_dte: int = 35
     max_spread_width: float = 5.0
@@ -70,6 +70,12 @@ class BotConfig:
     time_stop_days: int = 5              # close a stalled trade after this many calendar days...
     time_stop_move_pct: float = 20.0     # ...if it is still within +/- this % of entry
     expiry_buffer_days: int = 3          # always close when this close to expiration (theta cliff)
+
+    # Strategy: "single_leg" (original signal-driven ATM option) or "call_spread_trend"
+    # (trend-gated 60-day bull call spread — see bot/spread_strategy.py)
+    strategy: str = "single_leg"
+    spread_dte_min: int = 50
+    spread_dte_max: int = 75
 
 
 def load_config() -> BotConfig:
@@ -94,6 +100,9 @@ def load_config() -> BotConfig:
         time_stop_days=int(os.getenv("TIME_STOP_DAYS", 5)),
         time_stop_move_pct=float(os.getenv("TIME_STOP_MOVE_PCT", 20)),
         expiry_buffer_days=int(os.getenv("EXPIRY_BUFFER_DAYS", 3)),
+        strategy=os.getenv("STRATEGY", "single_leg").lower(),
+        spread_dte_min=int(os.getenv("SPREAD_DTE_MIN", 50)),
+        spread_dte_max=int(os.getenv("SPREAD_DTE_MAX", 75)),
     )
 
 
