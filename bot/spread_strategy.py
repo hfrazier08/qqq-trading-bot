@@ -130,3 +130,20 @@ def spread_value(ticker: str, expiration: str, long_strike: float, short_strike:
     except Exception as e:
         logger.warning(f"Spread value lookup failed: {e}")
         return None
+
+
+def spread_quote(ticker: str, expiration: str, long_strike: float, short_strike: float) -> Optional[dict]:
+    """Current bid/ask of both legs (used to log real fills)."""
+    try:
+        calls = yf.Ticker(ticker).option_chain(expiration).calls
+        l = calls[calls["strike"] == long_strike]
+        s = calls[calls["strike"] == short_strike]
+        if l.empty or s.empty:
+            return None
+        l, s = l.iloc[0], s.iloc[0]
+        q = {"long_bid": float(l["bid"]), "long_ask": float(l["ask"]),
+             "short_bid": float(s["bid"]), "short_ask": float(s["ask"])}
+        return q if min(q.values()) >= 0 and q["long_ask"] > 0 and q["short_ask"] > 0 else None
+    except Exception as e:
+        logger.warning(f"Spread quote lookup failed: {e}")
+        return None

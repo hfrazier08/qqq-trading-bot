@@ -22,7 +22,10 @@ from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message, format_spread_embed
 from bot.alert_sender import send_all_alerts, send_discord_alert
 from bot.analytics import breakdown
-from bot.spread_strategy import construct_call_spread, spread_value, TP_PCT as SPREAD_TP, SL_PCT as SPREAD_SL
+from bot import health, risk
+from bot.benchmark import benchmark_line
+from bot.fills import log_fill, fills_summary
+from bot.spread_strategy import construct_call_spread, spread_value, spread_quote, TP_PCT as SPREAD_TP, SL_PCT as SPREAD_SL
 from bot.trade_logger import init_db, log_signal, log_trade_entry, update_trade_exit
 # Flow/sentiment handled by SPY bot only — not imported here
 
@@ -127,6 +130,10 @@ def _close_paper_trade(exit_price: float, reason: str) -> dict:
         "pnl_pct": pnl_pct,
         "outcome": outcome,
     })
+    if _is_spread(t):
+        q = spread_quote(t["ticker"], t["expiration"], t["strike"], t["short_strike"])
+        if q:
+            log_fill("exit", t, q, exit_price, _spot(t.get("underlying_price", 0.0)))
     _save_paper_trade(t)
     if t.get("db_trade_id"):
         try:
@@ -180,8 +187,11 @@ def _todays_high_impact_events() -> list:
         return []
 
 
-def _entry_blocked_reason(signal, options, trade) -> Optional[str]:
+def _entry_blocked_reason(signal, options, trade, vix: Optional[float] = None) -> Optional[str]:
     """Pre-trade filters. Returns a human reason to skip, or None to allow the trade."""
+    guard = risk.entry_check(CONFIG, _load_paper_trades(), vix, getattr(trade, "total_cost", None))
+    if guard:
+        return guard
     if CONFIG.block_news_days:
         ev = _todays_high_impact_events()
         if ev:
@@ -275,6 +285,48 @@ def _current_value(t: dict) -> Optional[float]:
     return _fetch_current_option_price(t["ticker"], t["expiration"], t["strike"], t["direction"])
 
 
+_notified: set = set()
+
+
+def _notify_once(key: str, content: str) -> None:
+    """Send a Discord note at most once per key (keys include the date, so once per day)."""
+    if key in _notified:
+        return
+    _notified.add(key)
+    send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": content})
+
+
+def _spot(default: float) -> float:
+    try:
+        return float(yf.Ticker(CONFIG.spy).fast_info["lastPrice"])
+    except Exception:
+        return default
+
+
+def _alert_error(what: str, exc: Exception) -> None:
+    if health.error_alert_due():
+        send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": (
+            f"🚨 **{what} failed** — {type(exc).__name__}: {str(exc)[:200]}\n"
+            f"The bot will retry on the next cycle. If this keeps repeating, check the data source.")})
+
+
+def _after_scan_ok() -> None:
+    msg = health.scan_ok()
+    if msg:
+        send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": msg})
+
+
+def run_watchdog() -> None:
+    """Every 15 min in market hours: warn if scans have stopped succeeding."""
+    if not is_market_open():
+        return
+    now = datetime.now(ET)
+    open_dt = now.replace(hour=CONFIG.market_open_hour, minute=CONFIG.market_open_minute, second=0, microsecond=0)
+    msg = health.check_stale(now, open_dt, CONFIG.stale_scan_minutes)
+    if msg:
+        send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": msg})
+
+
 # ─────────────────────────────────────────────
 # STOP LOSS / TAKE PROFIT MONITOR — every 5 min
 # ─────────────────────────────────────────────
@@ -317,7 +369,11 @@ def run_position_monitor() -> None:
 
     trade = _active_paper_trade
     current_price = _current_value(trade)
-    if current_price is None or (current_price <= 0 and not _is_spread(trade)):
+    bad = current_price is None or (current_price <= 0 and not _is_spread(trade))
+    warn = health.monitor_result(not bad)
+    if warn:
+        send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": warn})
+    if bad:
         logger.warning("Position monitor: could not fetch a valid current option price")
         return
 
@@ -474,6 +530,13 @@ def _scan_spread_strategy(snapshot, technical, macro, options, signal) -> None:
                     f"(limit {CONFIG.max_spread_pct * 100:.0f}%)")
         return
 
+    blocked = risk.entry_check(CONFIG, _load_paper_trades(), snapshot.vix_current, spread.total_cost)
+    if blocked:
+        logger.info(f"Spread strategy: entry skipped — {blocked}")
+        _notify_once(f"blocked:{today}:{blocked[:24]}",
+                     f"⏸️ **Trend is up, but no spread opened today**\nReason: {blocked}.")
+        return
+
     payload = format_spread_embed(spread, price, ma200, signal.timestamp)
     sent = False
     for attempt in range(1, 4):
@@ -500,6 +563,9 @@ def _scan_spread_strategy(snapshot, technical, macro, options, signal) -> None:
         "spread_pct": round(spread.round_trip_cost / spread.ask_price * 100, 1),
         "entry_hour_et": datetime.now(ET).hour,
     }
+    log_fill("entry", _active_paper_trade,
+             {"long_bid": spread.long_bid, "long_ask": spread.long_ask,
+              "short_bid": spread.short_bid, "short_ask": spread.short_ask}, spread.ask_price, price)
     signal_id = log_signal(signal, price, snapshot.vix_current, options.iv_rank, macro.breadth_pct, alert_sent=True)
     _active_paper_trade["db_trade_id"] = log_trade_entry(signal_id, spread)
     _persist_active_trade()
@@ -522,6 +588,7 @@ def run_scan_cycle() -> None:
 
     try:
         snapshot, technical, macro, options, signal = _get_snapshot_and_signal()
+        _after_scan_ok()
 
         _daily_stats["scans"] += 1
         if signal.confidence > _daily_stats["highest_confidence"]:
@@ -601,7 +668,7 @@ def run_scan_cycle() -> None:
                     reset_cooldown()
                 else:
                     _refresh_trade_prices(trade)
-                    blocked = _entry_blocked_reason(signal, options, trade)
+                    blocked = _entry_blocked_reason(signal, options, trade, snapshot.vix_current)
                     if blocked:
                         logger.info(f"{signal.signal} skipped — {blocked}")
                         reset_cooldown()
@@ -664,6 +731,7 @@ def run_scan_cycle() -> None:
 
     except Exception as e:
         logger.exception(f"Scan cycle error: {e}")
+        _alert_error("Market scan", e)
 
 
 # ─────────────────────────────────────────────
@@ -927,6 +995,8 @@ def _build_money_report(period: str, trades: list, now_et: datetime) -> str:
 
     pnl_emoji = "💰" if total_pnl >= 0 else "📉"
     account   = CONFIG.account_size
+    bench_start = now_et.date() if period == "day" else (now_et - timedelta(days=now_et.weekday())).date()
+    bench_line = benchmark_line(CONFIG.spy, bench_start, total_pnl, account)
     pnl_pct   = round(total_pnl / account * 100, 1) if account else 0
 
     return (
@@ -936,6 +1006,7 @@ def _build_money_report(period: str, trades: list, now_et: datetime) -> str:
         f"✅ **Wins:** {len(wins)}  ❌ **Losses:** {len(losses)}  🎯 **Win Rate:** {win_rate}%\n"
         f"💵 **Avg Win:** +${avg_win:,.0f}  |  **Avg Loss:** -${abs(avg_loss):,.0f}\n"
         f"{pnl_emoji} **Total P&L:** {'+' if total_pnl >= 0 else '-'}${abs(total_pnl):,.0f} ({pnl_pct:+.1f}% of account)\n"
+        f"{bench_line}\n"
         f"💼 **Account:** ${account:,.0f}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"**Trade breakdown:**\n{trade_lines}"
@@ -953,12 +1024,24 @@ def run_weekly_report() -> None:
 
         body = _build_money_report("week", week_trades, now_et)
         bd = breakdown(all_trades, min_trades=5)   # all-time, so the sample grows past 50
+        closed_all = [t for t in all_trades if t.get("outcome") in ("win", "loss", "breakeven")]
+        alltime = ""
+        if closed_all:
+            first = min(str(t.get("entry_date") or str(t.get("entry_time", ""))[:10]) for t in closed_all)
+            try:
+                alltime = "All-time " + benchmark_line(CONFIG.spy, date.fromisoformat(first),
+                                                       sum(t.get("pnl", 0) for t in closed_all), CONFIG.account_size)
+            except ValueError:
+                alltime = ""
+        fills = fills_summary()
         send_discord_alert({
             "username": f"{CONFIG.spy} Options Bot",
             "content": (
                 f"📋 **{CONFIG.spy} Weekly Money Report — {now_et.strftime('%b %d, %Y')}**\n"
                 f"{body}"
                 f"🔍 Scans this week: **{_daily_stats['scans']}** (today only)\n"
+                f"{(alltime + chr(10)) if alltime else ''}"
+                f"{(fills + chr(10)) if fills else ''}"
                 f"{(bd + chr(10)) if bd else ''}"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Have a great weekend! See you Monday at **9:00 AM ET** 🚀"
@@ -1013,6 +1096,9 @@ def start_scheduler() -> None:
     scheduler.add_job(run_trend_update, trigger=IntervalTrigger(minutes=30),
                       id="trend_update", max_instances=1, coalesce=True, misfire_grace_time=600)
 
+    scheduler.add_job(run_watchdog, trigger=IntervalTrigger(minutes=15),
+                      id="watchdog", max_instances=1, coalesce=True, misfire_grace_time=300)
+
     scheduler.add_job(run_premarket_alert, trigger=CronTrigger(hour=9, minute=0, day_of_week="mon-fri", timezone=ET),
                       id="premarket", max_instances=1, coalesce=True, misfire_grace_time=900)
 
@@ -1037,6 +1123,12 @@ def start_scheduler() -> None:
     # NOTE: Flow scan, sentiment reports handled by SPY bot + sentiment bot only
     # QQQ bot only sends to QQQ channel
 
+    try:
+        resumed = f" Open trade restored: {_label(_active_paper_trade)}." if _active_paper_trade else ""
+        send_discord_alert({"username": f"{CONFIG.spy} Options Bot", "content": (
+            f"🔄 **{CONFIG.spy} bot started** — strategy: `{CONFIG.strategy}`.{resumed}")})
+    except Exception:
+        logger.exception("Startup notice failed")
     logger.info(f"Scheduler started — scanning every {CONFIG.scan_interval_minutes} minutes")
     run_scan_cycle()
     scheduler.start()

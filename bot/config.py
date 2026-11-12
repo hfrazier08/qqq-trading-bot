@@ -71,6 +71,12 @@ class BotConfig:
     time_stop_move_pct: float = 20.0     # ...if it is still within +/- this % of entry
     expiry_buffer_days: int = 3          # always close when this close to expiration (theta cliff)
 
+    # Account protection (all overridable via env; 0 disables a guard)
+    risk_off_vix: float = 30.0           # no new entries when VIX is above this
+    max_monthly_loss_pct: float = 10.0   # stop new entries for the month after realized losses reach this % of account
+    max_position_pct: float = 100.0      # skip an entry that costs more than this % of the account
+    stale_scan_minutes: int = 60         # alert if no scan has succeeded for this long during market hours
+
     # Strategy: "single_leg" (original signal-driven ATM option) or "call_spread_trend"
     # (trend-gated 60-day bull call spread — see bot/spread_strategy.py)
     strategy: str = "single_leg"
@@ -100,6 +106,10 @@ def load_config() -> BotConfig:
         time_stop_days=int(os.getenv("TIME_STOP_DAYS", 5)),
         time_stop_move_pct=float(os.getenv("TIME_STOP_MOVE_PCT", 20)),
         expiry_buffer_days=int(os.getenv("EXPIRY_BUFFER_DAYS", 3)),
+        risk_off_vix=float(os.getenv("RISK_OFF_VIX", 30)),
+        max_monthly_loss_pct=float(os.getenv("MAX_MONTHLY_LOSS_PCT", 10)),
+        max_position_pct=float(os.getenv("MAX_POSITION_PCT", 100)),
+        stale_scan_minutes=int(os.getenv("STALE_SCAN_MINUTES", 60)),
         strategy=os.getenv("STRATEGY", "single_leg").lower(),
         spread_dte_min=int(os.getenv("SPREAD_DTE_MIN", 50)),
         spread_dte_max=int(os.getenv("SPREAD_DTE_MAX", 75)),

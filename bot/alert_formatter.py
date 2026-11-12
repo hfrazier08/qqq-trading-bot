@@ -106,7 +106,8 @@ def format_spread_embed(spread, spot: float, ma200: float, timestamp: str) -> di
         f"## OPEN {spread.contracts}× {TICKER} ${spread.strike:.0f} / ${spread.short_strike:.0f} CALL SPREAD\n"
         f"**Buy** the ${spread.strike:.0f} call  ·  **Sell** the ${spread.short_strike:.0f} call  ·  same expiry\n"
         f"**Expires:** {spread.expiration_label}  ({spread.dte} days)\n"
-        f"**Net price:** ${debit:.2f} per share  →  **${spread.total_cost:,.0f} total**\n"
+        f"**Net price:** ${debit:.2f} per share  →  **${spread.total_cost:,.0f} total** "
+        f"({spread.risk_pct_used:.1f}% of your ${spread.account_size:,.0f} account)\n"
         f"**Most you can lose:** ${spread.total_cost:,.0f}  ·  **Most you can make:** "
         f"${spread.max_profit_per_share * 100 * spread.contracts:,.0f}"
     )
