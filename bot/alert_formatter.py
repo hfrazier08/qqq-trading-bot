@@ -1,8 +1,12 @@
+from datetime import datetime, timedelta
 from typing import Optional
+
+import pytz
 from bot.config import CONFIG
 from bot.signal_generator import TradingSignal, BUY_CALL, BUY_PUT, EXIT_LONG, EXIT_SHORT, HOLD
 from bot.trade_constructor import SingleLegTrade
 
+ET = pytz.timezone("America/New_York")
 TICKER = CONFIG.spy  # "SPY" or "QQQ" depending on which bot
 
 SIGNAL_COLORS = {
@@ -32,118 +36,61 @@ def format_discord_embed(
     trade: Optional[SingleLegTrade],
     spy_price: float,
 ) -> dict:
+    """Entry alert. Read top-to-bottom: WHAT to buy -> HOW to exit -> WHY. Everything else is small print."""
     emoji = SIGNAL_EMOJI.get(signal.signal, "⚪")
     color = SIGNAL_COLORS.get(signal.signal, 0x9E9E9E)
-    conf_label = _confidence_label(signal.confidence)
-
-    title = f"{emoji} {TICKER} {signal.signal.replace('_', ' ')} — {signal.confidence}% ({conf_label})"
-
-    fields = []
-
-    fields.append({
-        "name": "📊 Market Snapshot",
-        "value": (
-            f"**{TICKER} Price:** ${spy_price:.2f}\n"
-            f"**Signal:** {signal.signal}\n"
-            f"**Direction:** {signal.direction.capitalize()}\n"
-            f"**Risk Level:** {signal.risk_level.capitalize()}"
-        ),
-        "inline": False,
-    })
+    action = {BUY_CALL: "BUY CALL", BUY_PUT: "BUY PUT"}.get(signal.signal, signal.signal.replace("_", " "))
+    title = f"{emoji} {TICKER} {action} — {signal.confidence}% ({_confidence_label(signal.confidence)})"
 
     bd = signal.confidence_breakdown
-    fields.append({
-        "name": "🎯 Confidence Breakdown",
-        "value": (
-            f"Technical: **{bd.get('technical', 0)}/50**\n"
-            f"Macro: **{bd.get('macro', 0)}/30**\n"
-            f"Options: **{bd.get('options', 0)}/20**\n"
-            f"Total: **{signal.confidence}/100**"
-        ),
-        "inline": True,
-    })
-
-    reasons_text = "\n".join(f"• {r}" for r in signal.signal_reasons[:5])
-    fields.append({
-        "name": "🔍 Research Summary",
-        "value": reasons_text[:1024] if reasons_text else "N/A",
-        "inline": False,
-    })
+    scores = (f"Tech {bd.get('technical', 0)}/50 · Macro {bd.get('macro', 0)}/30 · "
+              f"Options {bd.get('options', 0)}/20")
+    fields = []
 
     if trade is not None:
+        today = datetime.now(ET).date()
+        exp = datetime.strptime(trade.expiration, "%Y-%m-%d").date()
+        stall_by = today + timedelta(days=CONFIG.time_stop_days)
+        close_by = exp - timedelta(days=CONFIG.expiry_buffer_days)
+        tp = trade.ask_price * 1.5
+        sl = trade.ask_price * 0.5
+        description = (
+            f"## BUY {trade.contracts}× {TICKER} ${trade.strike:.0f} {trade.option_type}\n"
+            f"**Expires:** {trade.expiration_label}  ({trade.dte} days)\n"
+            f"**Limit price:** ${trade.ask_price:.2f} per share  →  **${trade.total_cost:,.0f} total** "
+            f"({trade.risk_pct_used:.1f}% of account)\n"
+            f"**Most you can lose:** ${trade.total_cost:,.0f} (the premium)"
+        )
         fields.append({
-            "name": f"💼 Trade: Buy {trade.option_type}",
+            "name": "🚪 Exit plan — set these up now",
             "value": (
-                f"**Symbol:** {TICKER}\n"
-                f"**Action:** Buy {trade.option_type}\n"
-                f"**Strike:** ${trade.strike:.0f}\n"
-                f"**Expiration:** {trade.expiration_label} ({trade.dte} DTE)"
-            ),
-            "inline": True,
-        })
-
-        fields.append({
-            "name": "💰 Pricing",
-            "value": (
-                f"**Ask Price:** ${trade.ask_price:.2f}/contract\n"
-                f"**Bid Price:** ${trade.bid_price:.2f}/contract\n"
-                f"**Cost:** ${trade.cost_per_contract:.0f} per contract\n"
-                f"**IV:** {trade.implied_volatility:.0f}%  |  **Delta:** {trade.delta:.2f}"
-            ),
-            "inline": True,
-        })
-
-        fields.append({
-            "name": "📐 Position Size",
-            "value": (
-                f"**Contracts:** {trade.contracts}\n"
-                f"**Total Cost:** ${trade.total_cost:,.0f}\n"
-                f"**% of Account:** {trade.risk_pct_used:.1f}%\n"
-                f"**Max Loss:** ${trade.total_cost:,.0f} (full premium paid)"
-            ),
-            "inline": True,
-        })
-
-        fields.append({
-            "name": "🎯 Key Price Levels",
-            "value": (
-                f"**Breakeven at expiry:** ${trade.breakeven:.2f}\n"
-                f"**Profit target ({TICKER}):** ${trade.profit_target:.2f}\n"
-                f"**Stop loss:** Exit if option drops to **${trade.stop_loss_price:.2f}** (50% loss)"
+                f"✅ **Take profit:** sell if the option hits **${tp:.2f}** (+50%)\n"
+                f"🛑 **Stop loss:** sell if it falls to **${sl:.2f}** (−50%)\n"
+                f"⏱️ **Stalled?** if it's still within ±{CONFIG.time_stop_move_pct:.0f}% on **{stall_by.strftime('%b %-d')}**, sell\n"
+                f"⌛ **Last day to hold:** **{close_by.strftime('%b %-d')}** — time decay speeds up after that"
             ),
             "inline": False,
         })
+    else:
+        description = f"**{signal.direction.capitalize()}** setup on {TICKER} at ${spy_price:.2f}"
 
-        fields.append({
-            "name": "📋 How to Buy in Robinhood",
-            "value": _robinhood_steps(trade),
-            "inline": False,
-        })
+    reasons = "\n".join(f"• {r}" for r in signal.signal_reasons[:3])
+    fields.append({"name": "📈 Why this signal", "value": reasons[:1024] or "N/A", "inline": False})
 
-        fields.append({
-            "name": "📌 Trade Management",
-            "value": (
-                f"• **Take profit:** Sell when option price reaches **${trade.ask_price * 1.5:.2f}** (+50%)\n"
-                f"• **Stop loss:** Sell if option drops to **${trade.stop_loss_price:.2f}** (-50%)\n"
-                f"• **Hard exit:** Sell with 3–5 days left before expiration\n"
-                f"• **Do not hold** through expiration — time decay accelerates"
-            ),
-            "inline": False,
-        })
-
-    fields.append({
-        "name": "⚠️ Risk Disclosure",
-        "value": RISK_DISCLAIMER,
-        "inline": False,
-    })
+    small = [f"**{TICKER}:** ${spy_price:.2f}", f"**Risk:** {signal.risk_level.capitalize()}", f"**Score:** {scores}"]
+    if trade is not None:
+        small += [f"**Breakeven:** ${trade.breakeven:.2f}", f"**Delta:** {trade.delta:.2f}",
+                  f"**IV:** {trade.implied_volatility:.0f}%"]
+    fields.append({"name": "Details", "value": "  ·  ".join(small), "inline": False})
 
     return {
         "username": f"{TICKER} Options Bot",
         "embeds": [{
             "title": title,
+            "description": description,
             "color": color,
-            "fields": fields[:25],
-            "footer": {"text": f"Scanned at {signal.timestamp} | {TICKER} Options Bot"},
+            "fields": fields,
+            "footer": {"text": f"{signal.timestamp} · Paper trade first · Not financial advice"},
         }],
     }
 

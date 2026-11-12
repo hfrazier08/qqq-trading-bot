@@ -2,7 +2,7 @@ import json
 import logging
 import os
 import time
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from pathlib import Path
 from typing import Optional
 
@@ -21,6 +21,7 @@ from bot.signal_generator import generate_signal, reset_cooldown, HOLD, EXIT_LON
 from bot.trade_constructor import construct_trade
 from bot.alert_formatter import format_discord_embed, format_whatsapp_message
 from bot.alert_sender import send_all_alerts, send_discord_alert
+from bot.analytics import breakdown
 from bot.trade_logger import init_db, log_signal, log_trade_entry, update_trade_exit
 # Flow/sentiment handled by SPY bot only — not imported here
 
@@ -112,6 +113,10 @@ def _close_paper_trade(exit_price: float, reason: str) -> dict:
     pnl_pct = round((exit_price - entry) / entry * 100, 1) if entry else 0.0
     outcome = "win" if pnl > 0 else ("loss" if pnl < 0 else "breakeven")
     now = datetime.now(ET)
+    try:
+        t["held_days"] = (now.date() - date.fromisoformat(t.get("entry_date") or str(t.get("entry_time", ""))[:10])).days
+    except ValueError:
+        pass
     t.update({
         "exit_price": exit_price,
         "exit_time": now.strftime("%Y-%m-%d %I:%M %p ET"),
@@ -142,6 +147,55 @@ def is_market_open() -> bool:
     open_time = now.replace(hour=CONFIG.market_open_hour, minute=CONFIG.market_open_minute, second=0, microsecond=0)
     close_time = now.replace(hour=CONFIG.market_close_hour, minute=CONFIG.market_close_minute, second=0, microsecond=0)
     return open_time <= now <= close_time
+
+
+HIGH_IMPACT_KEYWORDS = [
+    "CPI", "PPI", "FOMC", "Fed", "Federal Reserve", "Interest Rate", "NFP", "Non-Farm",
+    "Jobs", "Unemployment", "GDP", "Inflation", "Retail Sales", "PCE", "Powell",
+]
+_news_cache: dict = {"day": None, "events": []}
+
+
+def _todays_high_impact_events() -> list:
+    """High-impact USD events scheduled today (cached per day). Fails open: if the calendar
+    can't be fetched we return [] and the bot keeps trading rather than going silent."""
+    today = datetime.now(ET).strftime("%Y-%m-%d")
+    if _news_cache["day"] == today:
+        return _news_cache["events"]
+    try:
+        import requests as req
+        resp = req.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+        resp.raise_for_status()
+        events = [
+            e.get("title", "") for e in resp.json()
+            if e.get("impact", "").lower() == "high" and e.get("currency") == "USD"
+            and e.get("date", "")[:10] == today
+            and any(k.lower() in e.get("title", "").lower() for k in HIGH_IMPACT_KEYWORDS)
+        ]
+        _news_cache.update(day=today, events=events)
+        return events
+    except Exception as e:
+        logger.warning(f"News calendar unavailable — not blocking on news today: {e}")
+        return []
+
+
+def _entry_blocked_reason(signal, options, trade) -> Optional[str]:
+    """Pre-trade filters. Returns a human reason to skip, or None to allow the trade."""
+    if CONFIG.block_news_days:
+        ev = _todays_high_impact_events()
+        if ev:
+            return f"high-impact news today ({', '.join(ev[:3])})"
+    if options.iv_rank > CONFIG.max_iv_rank:
+        return f"IV rank {options.iv_rank:.0f} > {CONFIG.max_iv_rank:.0f} (options too expensive)"
+    if trade is not None:
+        if trade.bid_price <= 0 or trade.ask_price <= 0:
+            return "no live bid/ask on the contract"
+        mid = (trade.ask_price + trade.bid_price) / 2
+        spread_pct = (trade.ask_price - trade.bid_price) / mid
+        if spread_pct > CONFIG.max_spread_pct:
+            return (f"bid/ask spread {spread_pct*100:.1f}% of premium "
+                    f"(${trade.bid_price:.2f}/${trade.ask_price:.2f}) > {CONFIG.max_spread_pct*100:.0f}% limit")
+    return None
 
 
 def _get_snapshot_and_signal(dry_run: bool = False):
@@ -210,22 +264,28 @@ def _exit_alert(kind: str, trade: dict, current: float) -> None:
     ticker, strike = trade["ticker"], trade["strike"]
     option_type = "Call" if trade["direction"] == "call" else "Put"
     pnl, pct = trade["pnl"], trade["pnl_pct"]
-    now_et = datetime.now(ET).strftime("%I:%M %p ET")
-    head = {
-        "take_profit": f"🚨 **EXIT NOW — TAKE PROFIT!**\n**{ticker} ${strike:.0f} {option_type}** is up **{pct:.0f}%** 🎉",
-        "stop_loss":   f"🛑 **STOP LOSS HIT — EXIT NOW**\n**{ticker} ${strike:.0f} {option_type}** is down **{abs(pct):.0f}%** 📉",
-        "signal_exit": f"🔄 **EXIT SIGNAL — conditions reversed**\n**{ticker} ${strike:.0f} {option_type}** ({pct:+.0f}%)",
-        "expiration":  f"⌛ **OPTION EXPIRING — CLOSE IT**\n**{ticker} ${strike:.0f} {option_type}** ({pct:+.0f}%)",
+    held = trade.get("held_days")
+    why = {
+        "take_profit":   "Target hit — lock it in",
+        "stop_loss":     "Stop loss hit — cut it",
+        "signal_exit":   "Signal reversed — get out",
+        "expiration":    "Expiring — close it",
+        "time_stop":     f"Stalled for {held if held is not None else '?'} days — theta is eating it",
+        "expiry_buffer": f"Under {CONFIG.expiry_buffer_days} days left — decay speeds up",
     }[kind]
-    pnl_line = f"+${pnl:,.0f}" if pnl >= 0 else f"-${abs(pnl):,.0f}"
+    icon = {"take_profit": "✅", "stop_loss": "🛑"}.get(kind, "🔔")
+    result = {"win": "WIN", "loss": "LOSS"}.get(trade["outcome"], "FLAT")
+    money = f"+${pnl:,.0f}" if pnl >= 0 else f"−${abs(pnl):,.0f}"
     send_discord_alert({
         "username": f"{ticker} Options Bot",
         "content": (
-            f"{head}\n"
-            f"Entry: **${trade['entry_price']:.2f}** → Now: **${current:.2f}**\n"
-            f"💰 **P&L: {pnl_line}** on {trade['contracts']} contract(s) — **{trade['outcome'].upper()}**\n"
-            f"📋 Go to Robinhood → find your {ticker} ${strike:.0f} {option_type} → **Sell to Close**\n"
-            f"⏰ {now_et}"
+            f"{icon} **SELL NOW — {ticker} ${strike:.0f} {option_type}**\n"
+            f"{why}\n"
+            f"\n"
+            f"**{result}: {money} ({pct:+.0f}%)**  on {trade['contracts']} contract(s)\n"
+            f"Bought **${trade['entry_price']:.2f}** → Selling **${current:.2f}**\n"
+            f"\n"
+            f"📲 Robinhood → {ticker} ${strike:.0f} {option_type} → **Sell to Close**"
         )
     })
 
@@ -260,8 +320,20 @@ def run_position_monitor() -> None:
         reason = "take_profit"
     elif pct_change <= SL_PCT:
         reason = "stop_loss"
-    elif date.today().isoformat() >= trade["expiration"]:
+    elif datetime.now(ET).date().isoformat() >= trade["expiration"]:
         reason = "expiration"
+    else:
+        entry_day = trade.get("entry_date") or str(trade.get("entry_time", ""))[:10]
+        try:
+            held_days = (datetime.now(ET).date() - date.fromisoformat(entry_day)).days
+            days_left = (date.fromisoformat(trade["expiration"]) - datetime.now(ET).date()).days
+        except ValueError:
+            held_days, days_left = 0, 999
+        trade["held_days"] = held_days
+        if days_left <= CONFIG.expiry_buffer_days:
+            reason = "expiry_buffer"
+        elif held_days >= CONFIG.time_stop_days and abs(pct_change) < CONFIG.time_stop_move_pct:
+            reason = "time_stop"
 
     if reason:
         closed = _close_paper_trade(current_price, reason)
@@ -272,14 +344,17 @@ def run_position_monitor() -> None:
     _monitor_ticks += 1
     if _monitor_ticks % 6:
         return
+    try:
+        days_left = (date.fromisoformat(trade["expiration"]) - datetime.now(ET).date()).days
+    except ValueError:
+        days_left = "?"
+    money = f"+${pnl:,.0f}" if pnl >= 0 else f"−${abs(pnl):,.0f}"
     send_discord_alert({
         "username": f"{ticker} Options Bot",
         "content": (
-            f"{'📈' if pct_change >= 0 else '📉'} **Open Trade Update** — {now_et}\n"
-            f"**{ticker} ${strike:.0f} {option_type}** | Entry: ${entry:.2f} → Now: **${current_price:.2f}** ({pct_change:+.1f}%)\n"
-            f"P&L: **{'+' if pnl >= 0 else '-'}${abs(pnl):,.0f}**  |  "
-            f"Take profit at: **${entry * (1 + TP_PCT/100):.2f}** (+50%)  |  "
-            f"Stop loss at: **${entry * (1 + SL_PCT/100):.2f}** (-50%)"
+            f"{'📈' if pct_change >= 0 else '📉'} **Open trade — {ticker} ${strike:.0f} {option_type}**  ·  {now_et}\n"
+            f"Now **${current_price:.2f}** (bought ${entry:.2f})  →  **{money} ({pct_change:+.0f}%)**\n"
+            f"Sell at **${entry * (1 + TP_PCT/100):.2f}** (profit) or **${entry * (1 + SL_PCT/100):.2f}** (stop)  ·  {days_left} days to expiry"
         )
     })
 
@@ -433,6 +508,12 @@ def run_scan_cycle() -> None:
                     reset_cooldown()
                 else:
                     _refresh_trade_prices(trade)
+                    blocked = _entry_blocked_reason(signal, options, trade)
+                    if blocked:
+                        logger.info(f"{signal.signal} skipped — {blocked}")
+                        reset_cooldown()
+                        trade = None
+                if trade is not None:
                     discord_payload = format_discord_embed(signal, trade, snapshot.spy_price)
                     whatsapp_msg = format_whatsapp_message(signal, trade, snapshot.spy_price)
                     for attempt in range(1, 4):
@@ -465,6 +546,20 @@ def run_scan_cycle() -> None:
                             "entry_date": datetime.now(ET).strftime("%Y-%m-%d"),
                             "confidence": signal.confidence,
                             "outcome": "open",
+                            # context for the win/loss breakdown
+                            "tech_score": signal.confidence_breakdown.get("technical"),
+                            "macro_score": signal.confidence_breakdown.get("macro"),
+                            "options_score": signal.confidence_breakdown.get("options"),
+                            "tech_bias": technical.technical_bias,
+                            "macro_bias": macro.macro_bias,
+                            "iv_rank": options.iv_rank,
+                            "vix": snapshot.vix_current,
+                            "underlying_price": snapshot.spy_price,
+                            "dte_at_entry": trade.dte,
+                            "delta": trade.delta,
+                            "spread_pct": round((trade.ask_price - trade.bid_price)
+                                                / ((trade.ask_price + trade.bid_price) / 2) * 100, 1),
+                            "entry_hour_et": datetime.now(ET).hour,
                         }
                         _current_position = _position_label(trade.direction)
                         started_trade = True
@@ -751,12 +846,14 @@ def run_weekly_report() -> None:
         week_trades = [t for t in all_trades if _exit_date(t) >= week_start_str]
 
         body = _build_money_report("week", week_trades, now_et)
+        bd = breakdown(all_trades, min_trades=5)   # all-time, so the sample grows past 50
         send_discord_alert({
             "username": f"{CONFIG.spy} Options Bot",
             "content": (
                 f"📋 **{CONFIG.spy} Weekly Money Report — {now_et.strftime('%b %d, %Y')}**\n"
                 f"{body}"
                 f"🔍 Scans this week: **{_daily_stats['scans']}** (today only)\n"
+                f"{(bd + chr(10)) if bd else ''}"
                 f"━━━━━━━━━━━━━━━━━━━━━━\n"
                 f"Have a great weekend! See you Monday at **9:00 AM ET** 🚀"
             )

@@ -56,6 +56,12 @@ if __name__ == "__main__":
             print(f"  {k:<20}: {v}")
         sys.exit(0)
 
+    if len(sys.argv) > 1 and sys.argv[1] == "analyze":
+        from bot.analytics import breakdown
+        from bot.scheduler import _load_paper_trades
+        print(breakdown(_load_paper_trades()) or "No closed trades yet.")
+        sys.exit(0)
+
     print_banner()
     log.main.info("QQQ bot starting — logs in qqq_trading_bot/logs/")
 

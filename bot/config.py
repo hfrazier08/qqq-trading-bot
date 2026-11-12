@@ -63,6 +63,14 @@ class BotConfig:
     cooldown_hours: int = 2
     cooldown_confidence_jump: int = 10
 
+    # Entry filters / exit rules (all overridable via env vars)
+    max_spread_pct: float = 0.08         # skip contracts whose (ask-bid)/mid is wider than this
+    max_iv_rank: float = 50.0            # don't buy options when IV rank is above this (overpaying)
+    block_news_days: bool = True         # no new entries on days with high-impact USD events
+    time_stop_days: int = 5              # close a stalled trade after this many calendar days...
+    time_stop_move_pct: float = 20.0     # ...if it is still within +/- this % of entry
+    expiry_buffer_days: int = 3          # always close when this close to expiration (theta cliff)
+
 
 def load_config() -> BotConfig:
     missing = [k for k in ["DISCORD_WEBHOOK_URL"] if not os.getenv(k)]
@@ -80,6 +88,12 @@ def load_config() -> BotConfig:
         min_iv_rank=int(os.getenv("MIN_IV_RANK", 20)),
         scan_interval_minutes=int(os.getenv("SCAN_INTERVAL_MINUTES", 20)),
         spy=os.getenv("TICKER", "QQQ").upper(),
+        max_spread_pct=float(os.getenv("MAX_SPREAD_PCT", 0.08)),
+        max_iv_rank=float(os.getenv("MAX_IV_RANK", 50)),
+        block_news_days=os.getenv("BLOCK_NEWS_DAYS", "true").lower() in ("1", "true", "yes"),
+        time_stop_days=int(os.getenv("TIME_STOP_DAYS", 5)),
+        time_stop_move_pct=float(os.getenv("TIME_STOP_MOVE_PCT", 20)),
+        expiry_buffer_days=int(os.getenv("EXPIRY_BUFFER_DAYS", 3)),
     )
 
 
