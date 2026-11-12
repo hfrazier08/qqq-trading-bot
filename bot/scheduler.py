@@ -49,6 +49,7 @@ ACTIVE_TRADE_FILE = str(DATA_DIR / "active_trade.json")    # the one open trade,
 TP_PCT = 50.0    # take profit at +50% on the option premium
 SL_PCT = -50.0   # stop loss at -50%
 
+_confidence_history: list = []   # last 5 scan confidences, shown in trend updates
 _monitor_ticks = 0   # position monitor runs every 5 min; user-facing update every 6th tick (30 min)
 
 
@@ -182,7 +183,7 @@ def _refresh_trade_prices(trade) -> None:
 
 
 def _fetch_current_option_price(ticker: str, expiration: str, strike: float, option_type: str) -> Optional[float]:
-    """Fetch the current mid price of a specific option from yfinance."""
+    """Current sellable price of an option: the bid, else bid/ask mid, else last."""
     try:
         t = yf.Ticker(ticker)
         chain = t.option_chain(expiration)
@@ -192,6 +193,8 @@ def _fetch_current_option_price(ticker: str, expiration: str, strike: float, opt
             return None
         bid = float(row.iloc[0].get("bid", 0) or 0)
         ask = float(row.iloc[0].get("ask", 0) or 0)
+        if bid > 0:                       # what you'd actually receive selling to close
+            return round(bid, 2)
         if ask > 0:
             return round((bid + ask) / 2, 2)
         return float(row.iloc[0].get("lastPrice", 0) or 0)
@@ -322,6 +325,7 @@ def run_opening_bell() -> None:
     if datetime.now(ET).weekday() >= 5:
         return
     _daily_stats = {"scans": 0, "highest_confidence": 0, "trades_fired": 0, "open_price": None, "milestone_70_sent": False}
+    _confidence_history.clear()
     try:
         snapshot = fetch_market_snapshot()
         _daily_stats["open_price"] = snapshot.spy_price
@@ -358,6 +362,8 @@ def run_scan_cycle() -> None:
         _daily_stats["scans"] += 1
         if signal.confidence > _daily_stats["highest_confidence"]:
             _daily_stats["highest_confidence"] = signal.confidence
+        _confidence_history.append(signal.confidence)
+        del _confidence_history[:-5]
         if _daily_stats["open_price"] is None:
             _daily_stats["open_price"] = snapshot.spy_price
 
@@ -499,11 +505,21 @@ def run_trend_update() -> None:
         bar = "🟩" * filled + "⬜" * (10 - filled)
         now_et = datetime.now(ET).strftime("%I:%M %p ET")
 
+        if len(_confidence_history) >= 2:
+            history_str = " → ".join(f"**{c}%**" for c in _confidence_history)
+            d = _confidence_history[-1] - _confidence_history[-2]
+            arrow = ("📈 Rising fast" if d >= 5 else "↗️ Rising" if d >= 1 else
+                     "📉 Dropping fast" if d <= -5 else "↘️ Falling" if d <= -1 else "➡️ Holding steady")
+            trend_line = f"Confidence: {history_str} — {arrow}"
+        else:
+            trend_line = f"Confidence: **{conf}%**"
+
         send_discord_alert({
             "username": f"{CONFIG.spy} Options Bot",
             "content": (
                 f"{emoji} **{trend}** — {now_et}\n"
-                f"**{CONFIG.spy}:** ${price:.2f}  |  **VIX:** {vix:.2f}  |  **Confidence:** {conf}%\n"
+                f"**{CONFIG.spy}:** ${price:.2f}  |  **VIX:** {vix:.2f}\n"
+                f"{trend_line}\n"
                 f"{bar}\n"
                 f"📌 {action.capitalize()}"
             )
